@@ -2113,6 +2113,16 @@ xqc_client_stream_read_notify(xqc_stream_t *stream, void *user_data)
 
     } while (read > 0 && !fin);
 
+    // In xqc_client_stream_read_notify, after the receive loop
+    user_stream->bytes_since_last_log += read_sum;
+    xqc_usec_t now = xqc_now();
+    if (now - user_stream->last_log_time > 1000000) { // Log every 1 second
+        double speed_kbps = (user_stream->bytes_since_last_log * 8.0) / ((now - user_stream->last_log_time) / 1000.0);
+        printf("[THROUGHPUT] ts:%" PRIu64 " speed:%.2f Kbps\n", now, speed_kbps);
+        user_stream->last_log_time = now;
+        user_stream->bytes_since_last_log = 0;
+    }
+
     // mpshell
     // printf("xqc_stream_recv read:%zd, offset:%zu, fin:%d\n", read_sum, user_stream->recv_body_len, fin);
 
