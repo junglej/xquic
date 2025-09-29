@@ -119,6 +119,9 @@ typedef struct user_stream_s {
     int                      snd_times;
     int                      rcv_times;
 
+    uint64_t last_log_time;
+    uint64_t bytes_since_last_log;
+
 } user_stream_t;
 
 typedef struct user_conn_s {
