@@ -1,0 +1,6 @@
+{
+    "files.associations": {
+        "xqc_http3.h": "c",
+        "xquic_typedef.h": "c"
+    }
+}

@@ -54,7 +54,7 @@ printf_null(const char *format, ...)
 
 
 #define XQC_PACKET_TMP_BUF_LEN 1500
-#define MAX_BUF_SIZE (100*1024*1024)
+#define MAX_BUF_SIZE (1000*1024*1024)
 
 #define XQC_MAX_TOKEN_LEN 256
 
@@ -69,6 +69,101 @@ typedef struct user_conn_s user_conn_t;
 
 
 #define XQC_TEST_DGRAM_BATCH_SZ 32
+
+#define MP_LOG_BUF_SIZE 4096
+#define MP_DEBUG_PREFIX "[MP_DEBUG]"
+
+/* 全局日志文件描述符 */
+static int g_mp_log_fd = -1;
+static int g_mp_log_to_stdout = 1;  /* 是否同时输出到stdout */
+static uint64_t g_mp_sample_interval_us = 100000;
+
+/**
+ * 设置多路径日志文件描述符
+ */
+static void mp_set_log_fd(int fd) {
+    g_mp_log_fd = fd;
+}
+
+/**
+ * 设置是否输出到stdout
+ * @param enable 1=同时输出到stdout, 0=仅写文件
+ */
+static void mp_set_stdout_output(int enable) {
+    g_mp_log_to_stdout = enable;
+}
+
+/**
+ * ✅ 核心函数：通用的多路径日志写入
+ * 同时支持写文件和stdout
+ */
+static void mp_write_log(const char *format, ...) {
+    char log_buf[MP_LOG_BUF_SIZE];
+    va_list args;
+    int log_len;
+    
+    /* 格式化日志内容 */
+    va_start(args, format);
+    log_len = vsnprintf(log_buf, MP_LOG_BUF_SIZE, format, args);
+    va_end(args);
+    
+    if (log_len < 0) {
+        return;
+    }
+    
+    /* 确保有换行符 */
+    if (log_len < MP_LOG_BUF_SIZE - 1 && log_buf[log_len - 1] != '\n') {
+        log_buf[log_len] = '\n';
+        log_buf[log_len + 1] = '\0';
+        log_len++;
+    }
+    
+    /* 写入文件 */
+    if (g_mp_log_fd > 0) {
+        ssize_t written = write(g_mp_log_fd, log_buf, log_len);
+        if (written < 0) {
+            fprintf(stderr, "[MP_LOG] Failed to write to log file: %s\n", strerror(errno));
+        }
+    }
+    
+    /* 同时输出到stdout（如果启用） */
+    if (g_mp_log_to_stdout) {
+        printf("%s", log_buf);
+        fflush(stdout);  /* 立即刷新，确保实时看到输出 */
+    }
+}
+
+/**
+ * ✅ 修正后的宏定义：使用mp_write_log而不是printf
+ */
+#define MP_LOG(fmt, ...) \
+    do { \
+        char _mp_buf[MP_LOG_BUF_SIZE]; \
+        snprintf(_mp_buf, MP_LOG_BUF_SIZE, \
+                 MP_DEBUG_PREFIX "|ts:%"PRIu64"|" fmt, \
+                 xqc_now(), ##__VA_ARGS__); \
+        mp_write_log("%s", _mp_buf); \
+    } while(0)
+
+#define MP_PATH_LOG(path_id, fmt, ...) \
+    do { \
+        char _mp_buf[MP_LOG_BUF_SIZE]; \
+        snprintf(_mp_buf, MP_LOG_BUF_SIZE, \
+                 MP_DEBUG_PREFIX "|ts:%"PRIu64"|path_id:%"PRIu64"|" fmt, \
+                 xqc_now(), (uint64_t)(path_id), ##__VA_ARGS__); \
+        mp_write_log("%s", _mp_buf); \
+    } while(0)
+
+#define MP_PACKET_LOG(path_id, pkt_size, direction, fmt, ...) \
+    do { \
+        char _mp_buf[MP_LOG_BUF_SIZE]; \
+        snprintf(_mp_buf, MP_LOG_BUF_SIZE, \
+                 MP_DEBUG_PREFIX "|ts:%"PRIu64"|path_id:%"PRIu64"|%s|size:%zd|" fmt, \
+                 xqc_now(), (uint64_t)(path_id), direction, \
+                 (ssize_t)(pkt_size), ##__VA_ARGS__); \
+        mp_write_log("%s", _mp_buf); \
+    } while(0)
+
 
 typedef struct user_datagram_block_s {
     unsigned char *recv_data;
@@ -193,6 +288,29 @@ typedef struct {
     int val;
 } cdf_entry_t;
 
+/**
+ * 多路径状态追踪结构体
+ * 用于记录每条路径的统计信息
+ */
+typedef struct mp_path_stats_s {
+    uint64_t path_id;
+    uint64_t packets_sent;
+    uint64_t packets_recv;
+    uint64_t bytes_sent;
+    uint64_t bytes_recv;
+    uint64_t last_send_time;
+    uint64_t last_recv_time;
+    xqc_usec_t rtt;
+    int is_active;
+    
+    // ✅ 新增：用于时间间隔采样
+    uint64_t last_sample_time;        // 上次采样时间
+    uint64_t last_sample_bytes_sent;  // 上次采样时的发送字节数
+    uint64_t last_sample_bytes_recv;  // 上次采样时的接收字节数
+    uint64_t last_sample_pkts_sent;   // 上次采样时的发送包数
+    uint64_t last_sample_pkts_recv;   // 上次采样时的接收包数
+} mp_path_stats_t;
+
 
 static char *g_server_addr = NULL;
 int g_server_port = TEST_SERVER_PORT;
@@ -294,6 +412,8 @@ int g_periodically_request = 0;
 
 static uint64_t last_recv_ts = 0;
 
+static mp_path_stats_t g_path_stats[XQC_DEMO_MAX_PATH_COUNT];
+
 /*
  CDF file format:
  N (N lines)
@@ -385,6 +505,219 @@ static void xqc_client_bytestream_timeout_callback(int, short, void*);
 /* 用于路径增删debug */
 static void xqc_client_path_callback(int fd, short what, void *arg);
 static void xqc_client_epoch_callback(int fd, short what, void *arg);
+
+
+/**
+ * 初始化路径统计信息
+ */
+static void mp_init_path_stats(uint64_t path_id) {
+    if (path_id >= XQC_DEMO_MAX_PATH_COUNT) return;
+    
+    g_path_stats[path_id].path_id = path_id;
+    g_path_stats[path_id].packets_sent = 0;
+    g_path_stats[path_id].packets_recv = 0;
+    g_path_stats[path_id].bytes_sent = 0;
+    g_path_stats[path_id].bytes_recv = 0;
+    g_path_stats[path_id].last_send_time = 0;
+    g_path_stats[path_id].last_recv_time = 0;
+    g_path_stats[path_id].rtt = 0;
+    g_path_stats[path_id].is_active = 1;
+    
+    // ✅ 初始化采样基准
+    g_path_stats[path_id].last_sample_time = xqc_now();
+    g_path_stats[path_id].last_sample_bytes_sent = 0;
+    g_path_stats[path_id].last_sample_bytes_recv = 0;
+    g_path_stats[path_id].last_sample_pkts_sent = 0;
+    g_path_stats[path_id].last_sample_pkts_recv = 0;
+    
+    MP_PATH_LOG(path_id, "action:INIT|status:initialized|sample_interval:%"PRIu64"us",
+                g_mp_sample_interval_us);
+}
+
+static void mp_output_metrics(uint64_t path_id) {
+    if (path_id >= XQC_DEMO_MAX_PATH_COUNT) return;
+    
+    uint64_t now = xqc_now();
+    uint64_t elapsed = now - g_path_stats[path_id].last_sample_time;
+    
+    // 只有超过采样间隔才输出
+    if (elapsed < g_mp_sample_interval_us) {
+        return;
+    }
+    
+    // 计算增量
+    uint64_t delta_bytes_sent = g_path_stats[path_id].bytes_sent - 
+                                g_path_stats[path_id].last_sample_bytes_sent;
+    uint64_t delta_bytes_recv = g_path_stats[path_id].bytes_recv - 
+                                g_path_stats[path_id].last_sample_bytes_recv;
+    uint64_t delta_pkts_sent = g_path_stats[path_id].packets_sent - 
+                               g_path_stats[path_id].last_sample_pkts_sent;
+    uint64_t delta_pkts_recv = g_path_stats[path_id].packets_recv - 
+                               g_path_stats[path_id].last_sample_pkts_recv;
+    
+    // 计算瞬时带宽 (Mbps)
+    double elapsed_sec = elapsed / 1000000.0;
+    double send_bw_mbps = (delta_bytes_sent * 8.0) / (elapsed_sec * 1000000.0);
+    double recv_bw_mbps = (delta_bytes_recv * 8.0) / (elapsed_sec * 1000000.0);
+    
+    // 计算丢包率
+    double loss_rate = 0.0;
+    if (delta_pkts_sent > 0) {
+        int64_t lost = (int64_t)delta_pkts_sent - (int64_t)delta_pkts_recv;
+        loss_rate = lost > 0 ? ((double)lost / delta_pkts_sent * 100.0) : 0.0;
+    }
+    
+    // 输出JSON格式
+    MP_PATH_LOG(path_id,"METRICS_JSON|{\"ts\":%"PRIu64","
+           "\"path_id\":%"PRIu64","
+           "\"send_bw_mbps\":%.2f,"
+           "\"recv_bw_mbps\":%.2f,"
+           "\"loss_rate\":%.2f,"
+           "\"delta_sent_bytes\":%"PRIu64","
+           "\"delta_recv_bytes\":%"PRIu64","
+           "\"delta_sent_pkts\":%"PRIu64","
+           "\"delta_recv_pkts\":%"PRIu64","
+           "\"total_sent_bytes\":%"PRIu64","
+           "\"total_recv_bytes\":%"PRIu64","
+           "\"total_sent_pkts\":%"PRIu64","
+           "\"total_recv_pkts\":%"PRIu64","
+           "\"rtt_us\":%"PRIu64","
+           "\"is_active\":%d}\n",
+           now,
+           path_id,
+           send_bw_mbps,
+           recv_bw_mbps,
+           loss_rate,
+           delta_bytes_sent,
+           delta_bytes_recv,
+           delta_pkts_sent,
+           delta_pkts_recv,
+           g_path_stats[path_id].bytes_sent,
+           g_path_stats[path_id].bytes_recv,
+           g_path_stats[path_id].packets_sent,
+           g_path_stats[path_id].packets_recv,
+           g_path_stats[path_id].rtt,
+           g_path_stats[path_id].is_active);
+    
+    // 更新采样基准
+    g_path_stats[path_id].last_sample_time = now;
+    g_path_stats[path_id].last_sample_bytes_sent = g_path_stats[path_id].bytes_sent;
+    g_path_stats[path_id].last_sample_bytes_recv = g_path_stats[path_id].bytes_recv;
+    g_path_stats[path_id].last_sample_pkts_sent = g_path_stats[path_id].packets_sent;
+    g_path_stats[path_id].last_sample_pkts_recv = g_path_stats[path_id].packets_recv;
+}
+
+/**
+ * 更新路径发送统计
+ * @param path_id 路径ID
+ * @param size 发送的字节数
+ */
+static void mp_update_send_stats(uint64_t path_id, size_t size) {
+    if (path_id >= XQC_DEMO_MAX_PATH_COUNT) return;
+    
+    g_path_stats[path_id].packets_sent++;
+    g_path_stats[path_id].bytes_sent += size;
+    g_path_stats[path_id].last_send_time = xqc_now();
+
+    if (g_path_stats[path_id].packets_sent % 10 == 0) {
+        // TODO: 需要从xquic获取per-path RTT
+        // mp_update_path_rtt(user_conn, path_id);
+    }
+    
+    mp_output_metrics(path_id);
+}
+
+/**
+ * 更新路径接收统计
+ * @param path_id 路径ID
+ * @param size 接收的字节数
+ */
+static void mp_update_recv_stats(uint64_t path_id, size_t size) {
+    if (path_id >= XQC_DEMO_MAX_PATH_COUNT) return;
+    
+    g_path_stats[path_id].packets_recv++;
+    g_path_stats[path_id].bytes_recv += size;
+    g_path_stats[path_id].last_recv_time = xqc_now();
+    
+    mp_output_metrics(path_id);
+}
+
+static void mp_update_path_rtt(user_conn_t *user_conn, uint64_t path_id) {
+    if (!user_conn || !user_conn->quic_conn) return;
+    
+    // 从xquic获取路径统计信息
+    xqc_conn_stats_t conn_stats = xqc_conn_get_stats(ctx.engine, &user_conn->cid);
+    
+    g_path_stats[path_id].rtt = conn_stats.srtt;
+}
+
+/**
+ * 打印所有路径的汇总统计
+ */
+static void mp_print_summary_stats(void) {
+    MP_LOG("===== MULTIPATH SUMMARY STATISTICS =====");
+    
+    uint64_t total_sent = 0, total_recv = 0;
+    uint64_t total_sent_pkts = 0, total_recv_pkts = 0;
+    
+    for (int i = 0; i < XQC_DEMO_MAX_PATH_COUNT; i++) {
+        if (!g_path_stats[i].is_active && g_path_stats[i].packets_sent == 0) {
+            continue;
+        }
+        
+        total_sent += g_path_stats[i].bytes_sent;
+        total_recv += g_path_stats[i].bytes_recv;
+        total_sent_pkts += g_path_stats[i].packets_sent;
+        total_recv_pkts += g_path_stats[i].packets_recv;
+    }
+    
+    /* 打印每条路径的统计 */
+    for (int i = 0; i < XQC_DEMO_MAX_PATH_COUNT; i++) {
+        if (!g_path_stats[i].is_active && g_path_stats[i].packets_sent == 0) {
+            continue;
+        }
+        
+        double send_ratio = total_sent > 0 ? 
+            (g_path_stats[i].bytes_sent * 100.0 / total_sent) : 0.0;
+        double recv_ratio = total_recv > 0 ? 
+            (g_path_stats[i].bytes_recv * 100.0 / total_recv) : 0.0;
+        
+        uint64_t avg_send_size = g_path_stats[i].packets_sent > 0 ?
+            g_path_stats[i].bytes_sent / g_path_stats[i].packets_sent : 0;
+        uint64_t avg_recv_size = g_path_stats[i].packets_recv > 0 ?
+            g_path_stats[i].bytes_recv / g_path_stats[i].packets_recv : 0;
+        
+        MP_LOG("path_id:%d|status:%s", i, 
+               g_path_stats[i].is_active ? "ACTIVE" : "INACTIVE");
+        MP_LOG("  sent_pkts:%"PRIu64"|sent_bytes:%"PRIu64"|avg_pkt_size:%"PRIu64"|send_ratio:%.2f%%",
+               g_path_stats[i].packets_sent, g_path_stats[i].bytes_sent,
+               avg_send_size, send_ratio);
+        MP_LOG("  recv_pkts:%"PRIu64"|recv_bytes:%"PRIu64"|avg_pkt_size:%"PRIu64"|recv_ratio:%.2f%%",
+               g_path_stats[i].packets_recv, g_path_stats[i].bytes_recv,
+               avg_recv_size, recv_ratio);
+        
+        if (g_path_stats[i].last_send_time > 0 && g_path_stats[i].last_recv_time > 0) {
+            MP_LOG("  last_send_time:%"PRIu64"|last_recv_time:%"PRIu64,
+                   g_path_stats[i].last_send_time, g_path_stats[i].last_recv_time);
+        }
+    }
+    
+    MP_LOG("----------------------------------------");
+    MP_LOG("TOTAL STATISTICS:");
+    MP_LOG("  total_sent_pkts:%"PRIu64"|total_sent_bytes:%"PRIu64, 
+           total_sent_pkts, total_sent);
+    MP_LOG("  total_recv_pkts:%"PRIu64"|total_recv_bytes:%"PRIu64,
+           total_recv_pkts, total_recv);
+    
+    if (total_sent > 0 && total_recv > 0) {
+        double throughput = (total_sent + total_recv) * 8.0 / 1000.0; /* Kbps */
+        MP_LOG("  total_throughput:%.2f Kbps", throughput);
+    }
+    
+    MP_LOG("========================================");
+}
+
+
 
 /*  */
 
@@ -1022,20 +1355,63 @@ xqc_client_write_socket(const unsigned char *buf, size_t size,
     return res;
 }
 
+// int
+// xqc_client_get_path_fd_by_id(user_conn_t *user_conn, uint64_t path_id)
+// {
+//     int fd = user_conn->fd;
+
+//     if (!g_enable_multipath) {
+//         return fd;
+//     }
+
+//     for (int i = 0; i < g_multi_interface_cnt; i++) {
+//         if (g_client_path[i].path_id == path_id) {
+//             fd = g_client_path[i].path_fd;
+//             break;
+//         }
+//     }
+
+//     return fd;
+// }
+
+/**
+ * 优化后的根据path_id获取socket fd函数
+ * 增加详细的调试输出
+ */
 int
 xqc_client_get_path_fd_by_id(user_conn_t *user_conn, uint64_t path_id)
 {
     int fd = user_conn->fd;
 
+    int found = 0;  // ✅ 添加标志位
+
+    /* 如果未启用多路径，直接返回默认fd */
     if (!g_enable_multipath) {
+        MP_LOG("action:GET_FD|multipath:disabled|using_default_fd:%d", fd);
         return fd;
     }
 
+    MP_PATH_LOG(path_id, "action:GET_FD|searching_path");
+
+    /* 遍历所有路径查找对应的fd */
     for (int i = 0; i < g_multi_interface_cnt; i++) {
         if (g_client_path[i].path_id == path_id) {
             fd = g_client_path[i].path_fd;
+            found = 1;  // ✅ 标记找到
+            MP_PATH_LOG(path_id, 
+                "action:GET_FD|result:found|fd:%d|interface_index:%d|"
+                "interface:%s|is_in_use:%d|is_initial_path:%d",
+                fd, i, g_multi_interface[i], g_client_path[i].is_in_used,
+                (fd == user_conn->fd)); 
             break;
         }
+    }
+
+    if (!found) {
+        MP_PATH_LOG(path_id, 
+            "action:GET_FD|result:not_found|fallback_to_default_fd:%d|"
+            "available_paths:%d", 
+            fd, g_multi_interface_cnt);
     }
 
     return fd;
@@ -1060,6 +1436,9 @@ xqc_client_write_socket_ex(uint64_t path_id,
             if (user_conn->tracked_pkt_cnt < 2) {
                 /* send 10 pkts first */
                 user_conn->tracked_pkt_cnt++;
+                MP_PACKET_LOG(path_id, size, "SEND", 
+                    "test_case:41|action:tracking|count:%d", 
+                    user_conn->tracked_pkt_cnt);
 
             } else {
                 /* delay short header packet to make server idle timeout */
@@ -1068,14 +1447,22 @@ xqc_client_write_socket_ex(uint64_t path_id,
                 if (user_conn->black_hole_start_time == 0) {
                     user_conn->black_hole_start_time = nowtime;
                     printf("   blackhole start: %"PRIu64"\n", nowtime);
+                    MP_PACKET_LOG(path_id, size, "SEND",
+                        "test_case:41|action:blackhole_start|time:%"PRIu64, nowtime);
+                
                 }
 
                 if (nowtime - user_conn->black_hole_start_time <= 3000000) {
+                    MP_PACKET_LOG(path_id, size, "SEND",
+                        "test_case:41|action:blackhole_drop|duration:%"PRIu64"us",
+                        nowtime - user_conn->black_hole_start_time);
                     return size;
                 }
 
                 /* keep blackhole more than 2 seconds, turn off */
                 printf("   blackhole end: %"PRIu64"\n", nowtime);
+                MP_PACKET_LOG(path_id, size, "SEND",
+                    "test_case:41|action:blackhole_end|time:%"PRIu64, nowtime);
                 g_test_case = -1;
             }
         }
@@ -1116,12 +1503,21 @@ xqc_client_write_socket_ex(uint64_t path_id,
     /* get path fd */
     fd = xqc_client_get_path_fd_by_id(user_conn, path_id);
 
+    MP_PACKET_LOG(path_id, size, "SEND",
+        "action:fd_selected|fd:%d|peer_addr:%s|peer_port:%d",
+        fd, 
+        inet_ntoa(((struct sockaddr_in*)peer_addr)->sin_addr),
+        ntohs(((struct sockaddr_in*)peer_addr)->sin_port));
+
     /* COPY to run corruption test cases */
     unsigned char send_buf[XQC_PACKET_TMP_BUF_LEN];
     size_t send_buf_size = 0;
 
     if (size > XQC_PACKET_TMP_BUF_LEN) {
         printf("xqc_client_write_socket err: size=%zu is too long\n", size);
+        MP_PACKET_LOG(path_id, size, "SEND", 
+            "action:ERROR|reason:packet_too_large|max_size:%d", 
+            XQC_PACKET_TMP_BUF_LEN);
         return XQC_SOCKET_ERROR;
     }
     send_buf_size = size;
@@ -1154,16 +1550,44 @@ xqc_client_write_socket_ex(uint64_t path_id,
 
     if (g_enable_multipath) {
         g_client_path[path_id].send_size += size;
+        MP_PACKET_LOG(path_id, size, "SEND",
+            "action:update_path_stats|path_total_sent:%zu|percentage:%.2f%%",
+            g_client_path[path_id].send_size,
+            g_client_path[path_id].send_size * 100.0 / 
+            (g_client_path[0].send_size + g_client_path[1].send_size + 1));
     }
 
+    // if (hsk_completed) {
+    //     if (g_test_case == 103 && path_id == 0 && g_client_path[0].send_size > g_send_body_size/10) {
+    //         fd = g_client_path[0].rebinding_path_fd;
+    //     }
+    //     else if (g_test_case == 104 && path_id == 1 && g_client_path[1].send_size > 10240) {
+    //         fd = g_client_path[1].rebinding_path_fd;
+    //     }
+    // }
+
+    /* Rebinding测试 - 路径切换场景 */
     if (hsk_completed) {
-        if (g_test_case == 103 && path_id == 0 && g_client_path[0].send_size > g_send_body_size/10) {
+        if (g_test_case == 103 && path_id == 0 && 
+            g_client_path[0].send_size > g_send_body_size/10) {
+            int old_fd = fd;
             fd = g_client_path[0].rebinding_path_fd;
+            MP_PACKET_LOG(path_id, size, "SEND",
+                "test_case:103|action:REBINDING|old_fd:%d|new_fd:%d|"
+                "trigger_size:%zu|threshold:%d",
+                old_fd, fd, g_client_path[0].send_size, g_send_body_size/10);
         }
-        else if (g_test_case == 104 && path_id == 1 && g_client_path[1].send_size > 10240) {
+        else if (g_test_case == 104 && path_id == 1 && 
+                 g_client_path[1].send_size > 10240) {
+            int old_fd = fd;
             fd = g_client_path[1].rebinding_path_fd;
+            MP_PACKET_LOG(path_id, size, "SEND",
+                "test_case:104|action:REBINDING|old_fd:%d|new_fd:%d|"
+                "trigger_size:%zu|threshold:10240",
+                old_fd, fd, g_client_path[1].send_size);
         }
     }
+
 
     do {
         errno = 0;
@@ -1234,6 +1658,11 @@ xqc_client_write_socket_ex(uint64_t path_id,
         res = sendto(fd, send_buf, send_buf_size, 0, peer_addr, peer_addrlen);
         if (res < 0) {
             printf("xqc_client_write_socket_ex path:%"PRIu64" err %zd %s %zu\n", path_id, res, strerror(errno), send_buf_size);
+            
+            MP_PACKET_LOG(path_id, send_buf_size, "SEND",
+                "action:SEND_ERROR|errno:%d|error:%s|fd:%d",
+                errno, strerror(errno), fd);
+            
             if (errno == EAGAIN) {
                 res = XQC_SOCKET_EAGAIN;
             } else {
@@ -1242,6 +1671,11 @@ xqc_client_write_socket_ex(uint64_t path_id,
             if (errno == EMSGSIZE) {
                 res = send_buf_size;
             }
+        }else {
+            /* 发送成功 */
+            mp_update_send_stats(path_id, res);
+            MP_PACKET_LOG(path_id, res, "SEND",
+                "action:SEND_SUCCESS|fd:%d|actual_sent:%zd", fd, res);
         }
 
         if (sock_op_buffer_len) {
@@ -1679,22 +2113,54 @@ xqc_client_path_removed(const xqc_cid_t *scid, uint64_t path_id,
 {
     user_conn_t *user_conn = (user_conn_t *) conn_user_data;
 
+    MP_LOG("========== PATH REMOVAL EVENT ==========");
+    MP_PATH_LOG(path_id, "action:PATH_REMOVING|cid:%s",
+                xqc_scid_str(ctx.engine, scid));
+
     if (!g_enable_multipath) {
         return;
     }
 
     for (int i = 0; i < g_multi_interface_cnt; i++) {
         if (g_client_path[i].path_id == path_id) {
+
+            MP_PATH_LOG(path_id,
+                "action:PATH_STATS_BEFORE_REMOVE|interface_index:%d|"
+                "interface:%s|total_sent:%zu|is_in_use:%d",
+                i, g_multi_interface[i], 
+                g_client_path[i].send_size,
+                g_client_path[i].is_in_used);
+
             g_client_path[i].path_id = 0;
             g_client_path[i].is_in_used = 0;
             
             printf("***** path removed. index: %d, path_id: %" PRIu64 "\n", i, path_id);
+
+            if (path_id < XQC_DEMO_MAX_PATH_COUNT) {
+                g_path_stats[path_id].is_active = 0;
+            }
+            
+            MP_PATH_LOG(path_id,
+                "action:PATH_REMOVED|interface_index:%d|status:inactive",
+                i);
 
             xqc_client_set_path_debug_timer(user_conn);
             
             break;
         }
     }
+    int active_paths = 0;
+    for (int i = 0; i < g_multi_interface_cnt; i++) {
+        if (g_client_path[i].is_in_used) {
+            active_paths++;
+            MP_LOG("active_path|index:%d|path_id:%"PRIu64"|interface:%s",
+                   i, g_client_path[i].path_id, g_multi_interface[i]);
+        }
+    }
+    
+    MP_LOG("action:PATH_REMOVAL_COMPLETE|remaining_active_paths:%d",
+           active_paths);
+    MP_LOG("=======================================");
 }
 
 
@@ -3090,10 +3556,23 @@ xqc_client_socket_read_handler(user_conn_t *user_conn, int fd)
         p_ctx = &ctx;
     }
 
+    // for (i = 0; i < g_multi_interface_cnt; i++) {
+    //     path = &g_client_path[i];
+    //     if (path->path_fd == fd || path->rebinding_path_fd == fd) {
+    //         path_id = path->path_id;
+    //     }
+    // }
+    /* 识别接收数据的路径 */
     for (i = 0; i < g_multi_interface_cnt; i++) {
         path = &g_client_path[i];
         if (path->path_fd == fd || path->rebinding_path_fd == fd) {
             path_id = path->path_id;
+            MP_PATH_LOG(path_id, 
+                "action:RECV_IDENTIFY|fd:%d|interface_index:%d|"
+                "interface:%s|is_rebinding:%d",
+                fd, i, g_multi_interface[i], 
+                (path->rebinding_path_fd == fd));
+            break;
         }
     }
 
@@ -3163,16 +3642,25 @@ xqc_client_socket_read_handler(user_conn_t *user_conn, int fd)
 
         if (recv_size < 0) {
             printf("recvfrom: recvmsg = %zd(%s)\n", recv_size, strerror(get_sys_errno()));
+            MP_PACKET_LOG(path_id, 0, "RECV",
+                "action:RECV_ERROR|errno:%d|error:%s",
+                get_sys_errno(), strerror(get_sys_errno()));
             break;
         }
 
         /* if recv_size is 0, break while loop, */
         if (recv_size == 0) {
+            MP_PACKET_LOG(path_id, 0, "RECV", "action:RECV_EOF");
             break;
         }
 
         recv_sum += recv_size;
         rcv_sum += recv_size;
+
+        if (path_id != XQC_UNKNOWN_PATH_ID) {
+            mp_update_recv_stats(path_id, recv_size);
+        }
+
 
         if (user_conn->get_local_addr == 0) {
             user_conn->get_local_addr = 1;
@@ -3187,6 +3675,11 @@ xqc_client_socket_read_handler(user_conn_t *user_conn, int fd)
 
         uint64_t recv_time = xqc_now();
         g_last_sock_op_time = recv_time;
+
+        MP_PACKET_LOG(path_id, recv_size, "RECV",
+            "action:RECV_SUCCESS|fd:%d|recv_time:%"PRIu64"|"
+            "total_this_round:%zd",
+            fd, recv_time, recv_sum);
 
 
         if (TEST_DROP) continue;
@@ -3241,6 +3734,10 @@ xqc_client_socket_read_handler(user_conn_t *user_conn, int fd)
         }
 
     } while (recv_size > 0);
+
+    MP_PATH_LOG(path_id != XQC_UNKNOWN_PATH_ID ? path_id : 0,
+        "action:RECV_ROUND_COMPLETE|total_received:%zd|fd:%d",
+        recv_sum, fd);
 
     if ((xqc_now() - last_recv_ts) > 200000) {
         // mpshell
@@ -3508,6 +4005,27 @@ xqc_client_epoch_callback(int fd, short what, void *arg)
 
     g_cur_epoch++;
     printf("|xqc_client_epoch_callback|epoch:%d|\n", g_cur_epoch);
+    MP_LOG("EPOCH CALLBACK: %d/%d", g_cur_epoch, g_epoch);
+
+    if (g_cur_epoch >= g_epoch) {
+        MP_LOG("All epochs completed: %d/%d", g_cur_epoch, g_epoch);
+        
+        // 打印统计
+        if (g_enable_multipath) {
+            mp_print_summary_stats();
+        }
+        
+        // 主动关闭连接
+        if (user_conn->h3 == 0 || user_conn->h3 == 2) {
+            ret = xqc_h3_conn_close(ctx.engine, &user_conn->cid);
+        } else {
+            ret = xqc_conn_close(ctx.engine, &user_conn->cid);
+        }
+        
+        // 连接关闭会触发 close_notify 回调
+        // 在那里会调用 event_base_loopbreak(eb)
+        return;
+    }
 
     if (g_send_dgram) {
         if (user_conn->h3 == 1) {
@@ -3615,29 +4133,63 @@ xqc_client_epoch_callback(int fd, short what, void *arg)
     return;
 }
 
-int
-xqc_client_open_log_file(void *engine_user_data)
+/**
+ * 改进的 xqc_client_open_log_file 函数
+ * 在原有基础上，同时设置多路径日志的fd
+ */
+int xqc_client_open_log_file(void *engine_user_data)
 {
     client_ctx_t *ctx = (client_ctx_t*)engine_user_data;
-    //ctx->log_fd = open("/home/jiuhai.zjh/ramdisk/clog", (O_WRONLY | O_APPEND | O_CREAT), 0644);
+    
+    /* 打开日志文件 */
     ctx->log_fd = open(g_log_path, (O_WRONLY | O_APPEND | O_CREAT), 0644);
     if (ctx->log_fd <= 0) {
+        fprintf(stderr, "Failed to open log file: %s\n", g_log_path);
         return -1;
     }
+    
+    /* 同时设置多路径日志的fd */
+    mp_set_log_fd(ctx->log_fd);
+    
+    /* 写入日志文件开始标记 */
+    mp_write_log("========================================");
+    mp_write_log("  XQUIC Multipath Client Log Start");
+    mp_write_log("  Time: %"PRIu64, xqc_now());
+    mp_write_log("  Log File: %s", g_log_path);
+    mp_write_log("========================================");
+    
     return 0;
 }
 
-int
-xqc_client_close_log_file(void *engine_user_data)
+/**
+ * 改进的 xqc_client_close_log_file 函数
+ * 在关闭前写入汇总统计
+ */
+int xqc_client_close_log_file(void *engine_user_data)
 {
     client_ctx_t *ctx = (client_ctx_t*)engine_user_data;
+    
     if (ctx->log_fd <= 0) {
         return -1;
     }
+    
+    /* 写入日志文件结束标记和统计 */
+    mp_write_log("========================================");
+    mp_write_log("  XQUIC Multipath Client Log End");
+    mp_write_log("  Time: %"PRIu64, xqc_now());
+    mp_write_log("========================================");
+    
+    /* 打印多路径统计汇总 */
+    if (g_enable_multipath) {
+        mp_print_summary_stats();
+    }
+    
     close(ctx->log_fd);
+    ctx->log_fd = 0;
+    g_mp_log_fd = -1;
+    
     return 0;
 }
-
 
 void 
 xqc_client_write_log(xqc_log_level_t lvl, const void *buf, size_t count, void *engine_user_data)
@@ -3750,17 +4302,24 @@ void
 xqc_client_ready_to_create_path(const xqc_cid_t *cid, 
     void *conn_user_data)
 {
+    MP_LOG("========== MULTIPATH READY TO CREATE ==========");
+    MP_LOG("action:READY_TO_CREATE_PATH|cid:%s|total_interfaces:%d",
+           xqc_scid_str(ctx.engine, cid), g_multi_interface_cnt);
+
     printf("***** on_ready_to_create_path\n");
     uint64_t path_id = 0;
     user_conn_t *user_conn = (user_conn_t *) conn_user_data;
 
     if (!g_enable_multipath) {
+        MP_LOG("action:SKIP|reason:multipath_disabled");
         return;
     }
 
     if (g_test_case != 110) {
         for (int i = 0; i < g_multi_interface_cnt; i++) {
             if (g_client_path[i].is_in_used == 1) {
+                MP_LOG("action:SKIP_PATH|interface_index:%d|reason:already_in_use|"
+                   "path_id:%"PRIu64, i, g_client_path[i].path_id);
                 continue;
             }
         
@@ -3768,12 +4327,24 @@ xqc_client_ready_to_create_path(const xqc_cid_t *cid,
 
             if (ret < 0) {
                 printf("not support mp, xqc_conn_create_path err = %d\n", ret);
+                MP_LOG("action:CREATE_PATH_FAILED|interface_index:%d|"
+                   "interface:%s|error_code:%d|reason:mp_not_supported",
+                   i, g_multi_interface[i], ret);
                 return;
             }
 
             printf("***** create a new path. index: %d, path_id: %" PRIu64 "\n", i, path_id);
             g_client_path[i].path_id = path_id;
             g_client_path[i].is_in_used = 1;
+
+            mp_init_path_stats(path_id);
+
+            MP_LOG("===== PATH CREATED SUCCESSFULLY =====");
+            MP_PATH_LOG(path_id,
+                "action:PATH_CREATED|interface_index:%d|interface:%s|"
+                "fd:%d|is_in_use:%d",
+                i, g_multi_interface[i], g_client_path[i].path_fd,
+                g_client_path[i].is_in_used);
 
             if (g_test_case == 104) {
                 ret = xqc_conn_mark_path_standby(ctx.engine, &(user_conn->cid), 0);
@@ -3789,7 +4360,13 @@ xqc_client_ready_to_create_path(const xqc_cid_t *cid,
             if (g_mp_backup_mode || g_enable_fec) {
                 ret = xqc_conn_mark_path_standby(ctx.engine, &(user_conn->cid), path_id);
                 if (ret < 0) {
+                    MP_PATH_LOG(path_id,
+                    "action:MARK_STANDBY_FAILED|error_code:%d", ret);
                     printf("xqc_conn_mark_path_standby err = %d\n", ret);
+                }else {
+                    MP_PATH_LOG(path_id,
+                        "action:MARKED_AS_STANDBY|mode:%s",
+                        g_mp_backup_mode ? "BACKUP" : "FEC");
                 }
             }
 
@@ -3800,6 +4377,10 @@ xqc_client_ready_to_create_path(const xqc_cid_t *cid,
     } else {
         xqc_client_set_path_debug_timer(user_conn);
     }
+
+    MP_LOG("action:PATH_CREATION_COMPLETE|total_paths:%d", 
+           g_multi_interface_cnt);
+    MP_LOG("==============================================");
 }
 
 
@@ -4183,6 +4764,7 @@ int main(int argc, char *argv[]) {
         {"qlog_disable", no_argument, &long_opt_index, 12},
         {"qlog_importance", required_argument, &long_opt_index, 13},
         {"fec_timeout", required_argument, &long_opt_index, 14},
+        {"mp_sample_interval", required_argument, &long_opt_index, 15},
         {0, 0, 0, 0}
     };
 
@@ -4499,6 +5081,12 @@ int main(int argc, char *argv[]) {
             case 14:
                 fec_timeout = atoi(optarg);
                 printf("option fec_timeout: %"PRId64"\n", fec_timeout);
+                break;
+
+            case 15:
+                g_mp_sample_interval_us = atoi(optarg) * 1000;  // 毫秒转微秒
+                printf("option mp_sample_interval: %"PRIu64" ms\n", 
+                    g_mp_sample_interval_us / 1000);
                 break;
 
             default:
