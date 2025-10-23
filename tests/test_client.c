@@ -3978,6 +3978,7 @@ xqc_client_path_callback(int fd, short what, void *arg)
         }
 
         printf("***** create a new path. index: %d, path_id: %" PRIu64 "\n", i, path_id);
+        MP_LOG("***** create a new path. index: %d, path_id: %" PRIu64 "\n", i, path_id);
         g_client_path[i].path_id = path_id;
         g_client_path[i].is_in_used = 1;
 
