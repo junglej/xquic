@@ -4,3 +4,5 @@ bss/
 third_party/
 .idea/
 cmake-build-debug/
+ssl/server.crt
+ssl/server.key
