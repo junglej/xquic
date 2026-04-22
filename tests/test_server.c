@@ -18,6 +18,7 @@
 #include <stdint.h>
 
 #include "platform.h"
+#include "src/common/xqc_common.h"
 
 #ifndef XQC_SYS_WINDOWS
 #include <unistd.h>
@@ -171,10 +172,151 @@ char g_lb_cid_enc_key[XQC_LB_CID_KEY_LEN];
 size_t g_sid_len = 0;
 size_t g_lb_cid_enc_key_len = 0;
 static uint64_t last_snd_ts;
+static FILE *g_request_trace_fp = NULL;
+static char g_request_trace_path[512];
+static int g_request_trace_disabled = 0;
 
 
 #define XQC_TEST_LONG_HEADER_LEN 32769
 char test_long_value[XQC_TEST_LONG_HEADER_LEN] = {'\0'};
+
+static int
+xqc_server_build_sibling_path(const char *base_path, const char *filename,
+    char *out, size_t out_len)
+{
+    const char *slash;
+    int n;
+
+    if (filename == NULL || out == NULL || out_len == 0) {
+        return -1;
+    }
+
+    if (base_path == NULL || base_path[0] == '\0') {
+        n = snprintf(out, out_len, "%s", filename);
+        return (n > 0 && (size_t)n < out_len) ? 0 : -1;
+    }
+
+    slash = strrchr(base_path, '/');
+    if (slash == NULL) {
+        n = snprintf(out, out_len, "%s", filename);
+
+    } else if (slash == base_path) {
+        n = snprintf(out, out_len, "/%s", filename);
+
+    } else {
+        n = snprintf(out, out_len, "%.*s/%s", (int)(slash - base_path), base_path, filename);
+    }
+
+    return (n > 0 && (size_t)n < out_len) ? 0 : -1;
+}
+
+static int
+xqc_server_prepare_request_trace(void)
+{
+    long file_size;
+
+    if (g_request_trace_disabled) {
+        return -1;
+    }
+
+    if (g_request_trace_fp != NULL) {
+        return 0;
+    }
+
+    if (xqc_server_build_sibling_path(g_log_path, "server_request_trace.csv",
+                                      g_request_trace_path, sizeof(g_request_trace_path)) != 0)
+    {
+        printf("request trace path build failed\n");
+        g_request_trace_disabled = 1;
+        return -1;
+    }
+
+    g_request_trace_fp = fopen(g_request_trace_path, "a");
+    if (g_request_trace_fp == NULL) {
+        printf("open request trace failed: %s\n", g_request_trace_path);
+        g_request_trace_disabled = 1;
+        return -1;
+    }
+
+    setvbuf(g_request_trace_fp, NULL, _IOLBF, 0);
+    if (fseek(g_request_trace_fp, 0, SEEK_END) != 0) {
+        file_size = -1;
+    } else {
+        file_size = ftell(g_request_trace_fp);
+    }
+
+    if (file_size == 0) {
+        fprintf(g_request_trace_fp,
+                "ts_us,request_elapsed_ms,event,notify_flag,app_read_bytes,"
+                "stream_id,recv_body_size,send_body_size,stream_err,mp_state,"
+                "recv_next_read_offset,recv_merged_offset_end,recv_max_offset_seen,"
+                "recv_contiguous_buffered_bytes,recv_out_of_order_bytes,recv_gap_bytes,"
+                "recv_out_of_order_ranges,h3_body_buf_count,h3_body_buf_bytes,"
+                "body_recvd_final_size,blocked_delay_us,unblocked_delay_us,"
+                "header_begin_delay_us,body_begin_delay_us,fin_delay_us,"
+                "request_end_delay_us,first_pkt_rcv_delay_us,stream_close_delay_us,"
+                "cwnd_blocked_ms,retrans_cnt,sent_pkt_cnt\n");
+        fflush(g_request_trace_fp);
+    }
+
+    return 0;
+}
+
+static void
+xqc_server_close_request_trace(void)
+{
+    if (g_request_trace_fp != NULL) {
+        fclose(g_request_trace_fp);
+        g_request_trace_fp = NULL;
+    }
+}
+
+static void
+xqc_server_log_request_snapshot(xqc_h3_request_t *h3_request, const char *event,
+    xqc_request_notify_flag_t flag, ssize_t app_read_bytes)
+{
+    xqc_request_stats_t stats;
+    xqc_usec_t now;
+    xqc_usec_t create_time;
+    uint64_t request_elapsed_ms;
+
+    if (h3_request == NULL || event == NULL) {
+        return;
+    }
+
+    if (xqc_server_prepare_request_trace() != 0) {
+        return;
+    }
+
+    stats = xqc_h3_request_get_stats(h3_request);
+    now = xqc_now();
+    create_time = stats.h3r_begin_time;
+    request_elapsed_ms = create_time ? xqc_calc_delay(now, create_time) / 1000 : 0;
+
+    fprintf(g_request_trace_fp,
+            "%"PRIu64",%"PRIu64",%s,%u,%zd,"
+            "%"PRIu64",%zu,%zu,%d,%d,"
+            "%"PRIu64",%"PRIu64",%"PRIu64",%"PRIu64",%"PRIu64",%"PRIu64",%u,"
+            "%"PRIu64",%"PRIu64",%zu,"
+            "%"PRIu64",%"PRIu64",%"PRIu64",%"PRIu64",%"PRIu64",%"PRIu64",%"PRIu64",%"PRIu64","
+            "%"PRIu64",%u,%u\n",
+            now, request_elapsed_ms, event, (unsigned)flag, app_read_bytes,
+            stats.stream_id, stats.recv_body_size, stats.send_body_size, stats.stream_err, stats.mp_state,
+            stats.recv_stream_next_read_offset, stats.recv_stream_merged_offset_end,
+            stats.recv_stream_max_offset_seen, stats.recv_stream_contiguous_buffered_bytes,
+            stats.recv_stream_out_of_order_bytes, stats.recv_stream_gap_bytes,
+            stats.recv_stream_out_of_order_ranges, stats.h3_body_buf_count,
+            stats.h3_body_buf_bytes, stats.body_recvd_final_size,
+            xqc_calc_delay(stats.blocked_time, create_time),
+            xqc_calc_delay(stats.unblocked_time, create_time),
+            xqc_calc_delay(stats.h3r_header_begin_time, create_time),
+            xqc_calc_delay(stats.h3r_body_begin_time, create_time),
+            xqc_calc_delay(stats.stream_fin_time, create_time),
+            xqc_calc_delay(stats.h3r_end_time, create_time),
+            xqc_calc_delay(stats.stream_fst_pkt_rcv_time, create_time),
+            stats.stream_close_delay, stats.cwnd_blocked_ms, stats.retrans_cnt,
+            stats.sent_pkt_cnt);
+}
 
 /*
  CDF file format:
@@ -1332,6 +1474,8 @@ xqc_server_request_close_notify(xqc_h3_request_t *h3_request, void *user_data)
     DEBUG;
     user_stream_t *user_stream = (user_stream_t*)user_data;
 
+    xqc_server_log_request_snapshot(h3_request, "close_notify", XQC_REQ_NOTIFY_READ_NULL, 0);
+
     if (g_test_case == 100) {
         if (user_stream->ev_timeout) {
             event_free(user_stream->ev_timeout);
@@ -1361,6 +1505,7 @@ xqc_server_request_read_notify(xqc_h3_request_t *h3_request, xqc_request_notify_
     //DEBUG;
     int ret;
     unsigned char fin = 0;
+    ssize_t read_sum = 0;
     user_stream_t *user_stream = (user_stream_t *) user_data;
 
     if ((flag & XQC_REQ_NOTIFY_READ_HEADER) || (flag & XQC_REQ_NOTIFY_READ_TRAILER)) {
@@ -1426,7 +1571,6 @@ xqc_server_request_read_notify(xqc_h3_request_t *h3_request, xqc_request_notify_
         char buff[4096] = {0};
         size_t buff_size = 4096;
         ssize_t read;
-        ssize_t read_sum = 0;
         do {
             read = xqc_h3_request_recv_body(h3_request, buff, buff_size, &fin);
             if (read == -XQC_EAGAIN) {
@@ -1466,6 +1610,8 @@ xqc_server_request_read_notify(xqc_h3_request_t *h3_request, xqc_request_notify_
 
         printf("h3 fin only received\n");
     }
+
+    xqc_server_log_request_snapshot(h3_request, "read_notify", flag, read_sum);
 
     if (fin) {
         xqc_server_request_send(h3_request, user_stream);
@@ -2781,6 +2927,7 @@ int main(int argc, char *argv[]) {
     xqc_engine_destroy(ctx.engine);
     xqc_server_close_keylog_file(&ctx);
     xqc_server_close_log_file(&ctx);
+    xqc_server_close_request_trace();
     destroy_cdf();
 
     return 0;

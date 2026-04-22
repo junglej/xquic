@@ -391,6 +391,93 @@ xqc_h3_request_update_settings(xqc_h3_request_t *h3_request,
     return -XQC_EPARAM;
 }
 
+static void
+xqc_h3_request_collect_recv_stats(xqc_h3_request_t *h3_request, xqc_request_stats_t *stats)
+{
+    xqc_stream_t *stream;
+    xqc_stream_data_in_t *data_in;
+    xqc_list_head_t *pos;
+    xqc_list_buf_t *list_buf;
+    uint64_t union_end = 0;
+    int have_union = 0;
+
+    if (h3_request == NULL || stats == NULL || h3_request->h3_stream == NULL) {
+        return;
+    }
+
+    stats->stream_id = h3_request->h3_stream->stream_id;
+    stats->h3_body_buf_count = h3_request->body_buf_count;
+    stats->body_recvd_final_size = h3_request->body_recvd_final_size;
+
+    xqc_list_for_each(pos, &h3_request->body_buf) {
+        list_buf = xqc_list_entry(pos, xqc_list_buf_t, list_head);
+        if (list_buf->buf != NULL && list_buf->buf->data_len > list_buf->buf->consumed_len) {
+            stats->h3_body_buf_bytes += list_buf->buf->data_len - list_buf->buf->consumed_len;
+        }
+    }
+
+    stream = h3_request->h3_stream->stream;
+    if (stream == NULL) {
+        return;
+    }
+
+    data_in = &stream->stream_data_in;
+    stats->recv_stream_next_read_offset = data_in->next_read_offset;
+    stats->recv_stream_merged_offset_end = data_in->merged_offset_end;
+    stats->recv_stream_max_offset_seen = xqc_max(stream->stream_max_recv_offset,
+                                                 data_in->merged_offset_end);
+    if (data_in->merged_offset_end > data_in->next_read_offset) {
+        stats->recv_stream_contiguous_buffered_bytes = data_in->merged_offset_end
+                                                       - data_in->next_read_offset;
+    }
+
+    xqc_list_for_each(pos, &data_in->frames_tailq) {
+        xqc_stream_frame_t *frame = xqc_list_entry(pos, xqc_stream_frame_t, sf_list);
+        uint64_t range_start = frame->data_offset;
+        uint64_t range_end = frame->data_offset + frame->data_length;
+
+        if (range_end > stats->recv_stream_max_offset_seen) {
+            stats->recv_stream_max_offset_seen = range_end;
+        }
+
+        if (range_end <= data_in->merged_offset_end) {
+            continue;
+        }
+
+        range_start = xqc_max(range_start, data_in->merged_offset_end);
+        if (range_end <= range_start) {
+            continue;
+        }
+
+        if (!have_union) {
+            have_union = 1;
+            union_end = range_end;
+            stats->recv_stream_out_of_order_ranges = 1;
+            stats->recv_stream_out_of_order_bytes = range_end - range_start;
+            continue;
+        }
+
+        if (range_start <= union_end) {
+            if (range_end > union_end) {
+                stats->recv_stream_out_of_order_bytes += range_end - union_end;
+                union_end = range_end;
+            }
+
+        } else {
+            stats->recv_stream_out_of_order_ranges += 1;
+            stats->recv_stream_out_of_order_bytes += range_end - range_start;
+            union_end = range_end;
+        }
+    }
+
+    if (stats->recv_stream_max_offset_seen > data_in->merged_offset_end) {
+        uint64_t span_bytes = stats->recv_stream_max_offset_seen - data_in->merged_offset_end;
+        if (span_bytes > stats->recv_stream_out_of_order_bytes) {
+            stats->recv_stream_gap_bytes = span_bytes - stats->recv_stream_out_of_order_bytes;
+        }
+    }
+}
+
 xqc_request_stats_t
 xqc_h3_request_get_stats(xqc_h3_request_t *h3_request)
 {
@@ -441,6 +528,7 @@ xqc_h3_request_get_stats(xqc_h3_request_t *h3_request)
     stats.recv_time_with_fec = h3_request->recv_time_with_fec;
     stats.final_packet_time = h3_request->final_packet_time;
     stats.stream_close_delay = h3_request->stream_close_delay;
+    xqc_h3_request_collect_recv_stats(h3_request, &stats);
     xqc_h3_stream_get_path_info(h3_request->h3_stream);
     xqc_request_path_metrics_print(h3_request->h3_stream->h3c->conn,
                                    h3_request->h3_stream, &stats);

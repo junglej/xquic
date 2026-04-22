@@ -148,6 +148,7 @@ typedef struct xqc_http_headers_s {
  * @brief request statistics structure
  */
 typedef struct xqc_request_stats_s {
+    uint64_t    stream_id;
     size_t      send_body_size;
     size_t      recv_body_size;
     /** plaintext header size */
@@ -240,6 +241,16 @@ typedef struct xqc_request_stats_s {
     xqc_usec_t  recv_time_with_fec;
     xqc_usec_t  final_packet_time;
     xqc_usec_t  stream_close_delay;
+    uint64_t    recv_stream_next_read_offset;
+    uint64_t    recv_stream_merged_offset_end;
+    uint64_t    recv_stream_max_offset_seen;
+    uint64_t    recv_stream_contiguous_buffered_bytes;
+    uint64_t    recv_stream_out_of_order_bytes;
+    uint64_t    recv_stream_gap_bytes;
+    uint32_t    recv_stream_out_of_order_ranges;
+    uint64_t    h3_body_buf_count;
+    uint64_t    h3_body_buf_bytes;
+    size_t      body_recvd_final_size;
 } xqc_request_stats_t;
 
 /**
