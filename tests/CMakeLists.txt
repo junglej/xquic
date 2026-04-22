@@ -29,6 +29,8 @@ set(TEST_CLIENT_SOURCES
     test_client.c
 )
 
+set(TEST_CLIENT_EXTRA_LIBS "")
+
 if(${CMAKE_SYSTEM_NAME} MATCHES "Windows")
     set(GETOPT_SOURCES
         ${CMAKE_CURRENT_SOURCE_DIR}/getopt.c
@@ -71,7 +73,16 @@ else()
 endif()
 
 target_link_libraries(test_server ${APP_DEPEND_LIBS})
-target_link_libraries(test_client ${APP_DEPEND_LIBS})
+if(XQC_ENABLE_WIFI_MONITOR AND NOT CMAKE_SYSTEM_NAME MATCHES "Windows")
+    set(TEST_CLIENT_EXTRA_LIBS
+        "${XQC_WIFI_MONITOR_LIBBPF}"
+        elf
+        z
+    )
+    add_dependencies(test_client xqc_wifi_monitor_assets)
+endif()
+
+target_link_libraries(test_client ${APP_DEPEND_LIBS} ${TEST_CLIENT_EXTRA_LIBS})
 
 
 # build run_tests
@@ -160,4 +171,3 @@ if(HAVE_CUNIT)
     add_test(run_tests run_tests)
     add_dependencies(check run_tests)
 endif()
-

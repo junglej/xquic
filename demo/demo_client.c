@@ -20,6 +20,8 @@
 #include "common.h"
 #include "xqc_hq.h"
 #include "../tests/platform.h"
+#include "xqc_demo_wifi_monitor.h"
+#include "src/transport/scheduler/xqc_scheduler_observer.h"
 
 #ifdef XQC_SYS_WINDOWS
 #pragma comment(lib,"ws2_32.lib")
@@ -41,6 +43,12 @@
 #define MAX_BUF_SIZE            (100*1024*1024)
 #define XQC_INTEROP_TLS_GROUPS  "P-256:X25519:P-384:P-521"
 #define MAX_PATH_CNT            2
+#define XQC_DEMO_CLI_SHORT_DCID_LEN          8
+#define XQC_DEMO_CLI_QUIC_UNKNOWN_FIELD      0xFF
+#define XQC_DEMO_CLI_PATH_MAP_SUFFIX         ".path_map.csv"
+#define XQC_DEMO_CLI_SEND_TRACE_SUFFIX       ".send_trace.csv"
+#define XQC_DEMO_CLI_WIFI_STATE_SUFFIX       ".wifi_state_trace.csv"
+#define XQC_DEMO_CLI_SCHED_TRACE_SUFFIX      ".scheduler_trace.csv"
 
 
 typedef enum xqc_demo_cli_alpn_type_s {
@@ -386,12 +394,23 @@ typedef struct xqc_demo_cli_ctx_s {
     /* log context */
     int             log_fd;
     char            log_path[256];
+    int             path_map_fd;
+    int             send_trace_fd;
+    int             wifi_state_fd;
+    int             scheduler_trace_fd;
+    char            path_map_path[256];
+    char            send_trace_path[256];
+    char            wifi_state_path[256];
+    char            scheduler_trace_path[256];
 
     /* key log context */
     int             keylog_fd;
 
     /* client context */
     xqc_demo_cli_client_args_t  *args;
+    xqc_demo_wifi_monitor_t     *wifi_monitor;
+    char            wifi_monitor_output_dir[256];
+    char            wifi_monitor_config_path[256];
 
     /* task schedule context */
     xqc_demo_cli_task_ctx_t     task_ctx;
@@ -401,9 +420,12 @@ typedef struct xqc_demo_cli_user_path_s {
 
     uint64_t                path_id;
     uint8_t                 is_active;
+    int                     path_seq;
 
     int                     fd;
     int                     rebind_fd;
+    unsigned int            ifindex;
+    char                    ifname[64];
 
     struct sockaddr_in6     local_addr;
     socklen_t               local_addrlen;
@@ -457,6 +479,787 @@ xqc_demo_cli_delayed_idle_restart(int fd, short what, void *arg);
 
 void
 xqc_demo_cli_continue_send_reqs(xqc_demo_cli_user_conn_t *user_conn);
+
+typedef struct xqc_demo_cli_quic_visible_fields_s {
+    uint8_t                 header_form;
+    uint8_t                 pkt_type;
+    uint8_t                 dcid_len;
+    unsigned char           dcid[20];
+    unsigned char           pn_raw[4];
+    uint8_t                 pn_len;
+} xqc_demo_cli_quic_visible_fields_t;
+
+static void
+xqc_demo_cli_init_quic_visible_fields(xqc_demo_cli_quic_visible_fields_t *fields)
+{
+    if (!fields) {
+        return;
+    }
+
+    memset(fields, 0, sizeof(*fields));
+    fields->header_form = XQC_DEMO_CLI_QUIC_UNKNOWN_FIELD;
+    fields->pkt_type = XQC_DEMO_CLI_QUIC_UNKNOWN_FIELD;
+}
+
+static void
+xqc_demo_cli_format_hex_compact(const unsigned char *src, size_t len,
+    char *dst, size_t dst_len)
+{
+    static const char hex[] = "0123456789abcdef";
+    size_t i;
+
+    if (!dst || dst_len == 0) {
+        return;
+    }
+
+    if (!src || len == 0 || dst_len < 2) {
+        snprintf(dst, dst_len, "-");
+        return;
+    }
+
+    if (dst_len < (len * 2 + 1)) {
+        snprintf(dst, dst_len, "-");
+        return;
+    }
+
+    for (i = 0; i < len; i++) {
+        dst[i * 2] = hex[(src[i] >> 4) & 0x0f];
+        dst[i * 2 + 1] = hex[src[i] & 0x0f];
+    }
+    dst[len * 2] = '\0';
+}
+
+static int
+xqc_demo_cli_read_varint(const unsigned char *buf, size_t buf_len, size_t offset,
+    uint64_t *value, uint8_t *encoded_len)
+{
+    uint8_t b0;
+    uint8_t varint_len;
+    size_t i;
+
+    if (!buf || !value || !encoded_len || offset >= buf_len) {
+        return -1;
+    }
+
+    b0 = buf[offset];
+    switch (b0 >> 6) {
+    case 0:
+        varint_len = 1;
+        break;
+    case 1:
+        varint_len = 2;
+        break;
+    case 2:
+        varint_len = 4;
+        break;
+    default:
+        varint_len = 8;
+        break;
+    }
+
+    if (offset + varint_len > buf_len) {
+        return -1;
+    }
+
+    *value = (uint64_t)(b0 & 0x3f);
+    for (i = 1; i < varint_len; i++) {
+        *value = (*value << 8) | buf[offset + i];
+    }
+    *encoded_len = varint_len;
+    return 0;
+}
+
+static void
+xqc_demo_cli_parse_quic_visible_fields(const unsigned char *buf, size_t buf_len,
+    xqc_demo_cli_quic_visible_fields_t *fields)
+{
+    uint8_t byte0;
+    size_t cursor;
+    uint32_t version;
+    uint8_t dcid_len_raw, dcid_copy_len, scid_len_raw, pn_len_local, varint_len;
+    uint64_t varint_value;
+
+    xqc_demo_cli_init_quic_visible_fields(fields);
+
+    if (!buf || !fields || buf_len == 0) {
+        return;
+    }
+
+    byte0 = buf[0];
+    if ((byte0 & 0x40) == 0) {
+        return;
+    }
+
+    fields->header_form = (byte0 >> 7) & 0x01;
+
+    if (fields->header_form == 0) {
+        size_t short_dcid_len = XQC_DEMO_CLI_SHORT_DCID_LEN;
+
+        if (buf_len < 1 + short_dcid_len) {
+            return;
+        }
+
+        memcpy(fields->dcid, buf + 1, short_dcid_len);
+        fields->dcid_len = short_dcid_len;
+        fields->pkt_type = XQC_DEMO_CLI_QUIC_UNKNOWN_FIELD;
+
+        pn_len_local = (byte0 & 0x03) + 1;
+        if (buf_len < 1 + short_dcid_len + pn_len_local) {
+            xqc_demo_cli_init_quic_visible_fields(fields);
+            return;
+        }
+
+        memcpy(fields->pn_raw, buf + 1 + short_dcid_len, pn_len_local);
+        fields->pn_len = pn_len_local;
+        return;
+    }
+
+    if (buf_len < 6) {
+        return;
+    }
+
+    version = ((uint32_t)buf[1] << 24)
+        | ((uint32_t)buf[2] << 16)
+        | ((uint32_t)buf[3] << 8)
+        | (uint32_t)buf[4];
+
+    dcid_len_raw = buf[5];
+    if (buf_len < 6 + dcid_len_raw + 1) {
+        return;
+    }
+
+    dcid_copy_len = dcid_len_raw > sizeof(fields->dcid)
+        ? sizeof(fields->dcid) : dcid_len_raw;
+    memcpy(fields->dcid, buf + 6, dcid_copy_len);
+    fields->dcid_len = dcid_copy_len;
+
+    cursor = 6 + dcid_len_raw;
+    scid_len_raw = buf[cursor];
+    cursor += 1 + scid_len_raw;
+    if (cursor > buf_len) {
+        xqc_demo_cli_init_quic_visible_fields(fields);
+        return;
+    }
+
+    if (version == 0) {
+        fields->pkt_type = XQC_DEMO_CLI_QUIC_UNKNOWN_FIELD;
+        return;
+    }
+
+    fields->pkt_type = (byte0 >> 4) & 0x03;
+    if (fields->pkt_type == 3) {
+        return;
+    }
+
+    pn_len_local = (byte0 & 0x03) + 1;
+
+    if (fields->pkt_type == 0) {
+        if (xqc_demo_cli_read_varint(buf, buf_len, cursor, &varint_value, &varint_len) != 0) {
+            xqc_demo_cli_init_quic_visible_fields(fields);
+            return;
+        }
+        cursor += varint_len + (size_t)varint_value;
+        if (cursor > buf_len) {
+            xqc_demo_cli_init_quic_visible_fields(fields);
+            return;
+        }
+    }
+
+    if (xqc_demo_cli_read_varint(buf, buf_len, cursor, &varint_value, &varint_len) != 0) {
+        xqc_demo_cli_init_quic_visible_fields(fields);
+        return;
+    }
+    cursor += varint_len;
+    if (cursor + pn_len_local > buf_len) {
+        xqc_demo_cli_init_quic_visible_fields(fields);
+        return;
+    }
+
+    memcpy(fields->pn_raw, buf + cursor, pn_len_local);
+    fields->pn_len = pn_len_local;
+}
+
+static void
+xqc_demo_cli_build_aux_path(const char *log_path, const char *suffix,
+    char *out, size_t out_len)
+{
+    char base[256];
+    char *slash;
+    char *dot;
+
+    if (!out || out_len == 0 || !suffix) {
+        return;
+    }
+
+    if (!log_path || log_path[0] == '\0') {
+        snprintf(out, out_len, "demo_client%s", suffix);
+        return;
+    }
+
+    snprintf(base, sizeof(base), "%s", log_path);
+    slash = strrchr(base, '/');
+    dot = strrchr(slash ? slash + 1 : base, '.');
+    if (dot) {
+        *dot = '\0';
+    }
+
+    snprintf(out, out_len, "%s%s", base, suffix);
+}
+
+static int
+xqc_demo_cli_open_aux_csv(const char *path, const char *header)
+{
+    off_t end;
+    int fd;
+
+    if (!path || !header) {
+        return -1;
+    }
+
+    fd = open(path, O_WRONLY | O_APPEND | O_CREAT, 0644);
+    if (fd < 0) {
+        return -1;
+    }
+
+    end = lseek(fd, 0, SEEK_END);
+    if (end == 0) {
+        if (write(fd, header, strlen(header)) < 0
+            || write(fd, line_break, 1) < 0)
+        {
+            close(fd);
+            return -1;
+        }
+    }
+
+    return fd;
+}
+
+static void
+xqc_demo_cli_write_aux_line(int fd, const char *line)
+{
+    if (fd <= 0 || !line) {
+        return;
+    }
+
+    if (write(fd, line, strlen(line)) < 0) {
+        return;
+    }
+
+    (void) write(fd, line_break, 1);
+}
+
+static void
+xqc_demo_cli_open_aux_trace_files(xqc_demo_cli_ctx_t *ctx)
+{
+    if (!ctx) {
+        return;
+    }
+
+    xqc_demo_cli_build_aux_path(ctx->log_path, XQC_DEMO_CLI_PATH_MAP_SUFFIX,
+        ctx->path_map_path, sizeof(ctx->path_map_path));
+    xqc_demo_cli_build_aux_path(ctx->log_path, XQC_DEMO_CLI_SEND_TRACE_SUFFIX,
+        ctx->send_trace_path, sizeof(ctx->send_trace_path));
+    xqc_demo_cli_build_aux_path(ctx->log_path, XQC_DEMO_CLI_WIFI_STATE_SUFFIX,
+        ctx->wifi_state_path, sizeof(ctx->wifi_state_path));
+    xqc_demo_cli_build_aux_path(ctx->log_path, XQC_DEMO_CLI_SCHED_TRACE_SUFFIX,
+        ctx->scheduler_trace_path, sizeof(ctx->scheduler_trace_path));
+
+    ctx->path_map_fd = xqc_demo_cli_open_aux_csv(ctx->path_map_path,
+        "ts_us,conn,path_id,path_seq,ifname,ifindex,fd");
+    if (ctx->path_map_fd < 0) {
+        printf("open path map trace failed: %s, errno: %d\n",
+            ctx->path_map_path, get_sys_errno());
+    } else {
+        printf("path map trace: %s\n", ctx->path_map_path);
+    }
+
+    ctx->send_trace_fd = xqc_demo_cli_open_aux_csv(ctx->send_trace_path,
+        "ts_us,conn,path_id,path_seq,ifname,ifindex,fd,len,quic_form,quic_type,quic_dcid,quic_pn_raw,quic_pn_len");
+    if (ctx->send_trace_fd < 0) {
+        printf("open send trace failed: %s, errno: %d\n",
+            ctx->send_trace_path, get_sys_errno());
+    } else {
+        printf("send trace: %s\n", ctx->send_trace_path);
+    }
+
+    ctx->wifi_state_fd = xqc_demo_cli_open_aux_csv(ctx->wifi_state_path,
+        "ts_us,conn,path_id,path_seq,ifname,ifindex,wifi_state,pi_degraded,p_long_gap,r_eff_Bpus,last_gap_us,ewma_gap_us,ewma_airtime_us,ewma_burst_bytes,sample_count,last_update_ts_us");
+    if (ctx->wifi_state_fd < 0) {
+        printf("open wifi state trace failed: %s, errno: %d\n",
+            ctx->wifi_state_path, get_sys_errno());
+    } else {
+        printf("wifi state trace: %s\n", ctx->wifi_state_path);
+    }
+
+    ctx->scheduler_trace_fd = xqc_demo_cli_open_aux_csv(ctx->scheduler_trace_path,
+        "ts_us,conn,scheduler,selected_path_id,selected_ifname,selected_ifindex,selected_on_degraded,other_cleaner,path0_id,path0_ifname,path0_ifindex,path0_srtt_us,path0_cwnd_bytes,path0_bytes_in_flight,path0_can_send,path0_path_state,path0_app_status,path0_wifi_state,path0_pi,path0_p_long_gap,path0_last_gap_us,path0_r_eff_Bpus,path1_id,path1_ifname,path1_ifindex,path1_srtt_us,path1_cwnd_bytes,path1_bytes_in_flight,path1_can_send,path1_path_state,path1_app_status,path1_wifi_state,path1_pi,path1_p_long_gap,path1_last_gap_us,path1_r_eff_Bpus");
+    if (ctx->scheduler_trace_fd < 0) {
+        printf("open scheduler trace failed: %s, errno: %d\n",
+            ctx->scheduler_trace_path, get_sys_errno());
+    } else {
+        printf("scheduler trace: %s\n", ctx->scheduler_trace_path);
+    }
+}
+
+static void
+xqc_demo_cli_close_aux_trace_files(xqc_demo_cli_ctx_t *ctx)
+{
+    if (!ctx) {
+        return;
+    }
+
+    if (ctx->path_map_fd > 0) {
+        close(ctx->path_map_fd);
+        ctx->path_map_fd = 0;
+    }
+
+    if (ctx->send_trace_fd > 0) {
+        close(ctx->send_trace_fd);
+        ctx->send_trace_fd = 0;
+    }
+
+    if (ctx->wifi_state_fd > 0) {
+        close(ctx->wifi_state_fd);
+        ctx->wifi_state_fd = 0;
+    }
+
+    if (ctx->scheduler_trace_fd > 0) {
+        close(ctx->scheduler_trace_fd);
+        ctx->scheduler_trace_fd = 0;
+    }
+}
+
+static void
+xqc_demo_cli_log_path_map(xqc_demo_cli_user_conn_t *user_conn,
+    xqc_demo_cli_user_path_t *user_path)
+{
+    char line[512];
+    xqc_demo_cli_ctx_t *ctx;
+
+    if (!user_conn || !user_path) {
+        return;
+    }
+
+    ctx = user_conn->ctx;
+    if (!ctx || ctx->path_map_fd <= 0) {
+        return;
+    }
+
+    snprintf(line, sizeof(line), "%"PRIu64",%p,%"PRIu64",%d,%s,%u,%d",
+        xqc_now(), user_conn, user_path->path_id, user_path->path_seq,
+        user_path->ifname[0] ? user_path->ifname : "-",
+        user_path->ifindex, user_path->fd);
+    xqc_demo_cli_write_aux_line(ctx->path_map_fd, line);
+}
+
+static void
+xqc_demo_cli_log_send_trace(xqc_demo_cli_user_path_t *user_path,
+    const unsigned char *buf, size_t len)
+{
+    char dcid_hex[41];
+    char pn_hex[9];
+    char line[640];
+    xqc_demo_cli_ctx_t *ctx;
+    xqc_demo_cli_quic_visible_fields_t fields;
+
+    if (!user_path || !user_path->user_conn) {
+        return;
+    }
+
+    ctx = user_path->user_conn->ctx;
+    if (!ctx || ctx->send_trace_fd <= 0) {
+        return;
+    }
+
+    xqc_demo_cli_parse_quic_visible_fields(buf, len, &fields);
+    xqc_demo_cli_format_hex_compact(fields.dcid, fields.dcid_len, dcid_hex, sizeof(dcid_hex));
+    xqc_demo_cli_format_hex_compact(fields.pn_raw, fields.pn_len, pn_hex, sizeof(pn_hex));
+
+    snprintf(line, sizeof(line), "%"PRIu64",%p,%"PRIu64",%d,%s,%u,%d,%zu,%u,%u,%s,%s,%u",
+        xqc_now(), user_path->user_conn, user_path->path_id, user_path->path_seq,
+        user_path->ifname[0] ? user_path->ifname : "-",
+        user_path->ifindex, user_path->fd, len,
+        fields.header_form, fields.pkt_type, dcid_hex, pn_hex, fields.pn_len);
+    xqc_demo_cli_write_aux_line(ctx->send_trace_fd, line);
+}
+
+static const char *
+xqc_demo_cli_wifi_state_label(xqc_demo_wifi_path_state_t state)
+{
+    switch (state) {
+    case XQC_DEMO_WIFI_PATH_STATE_REGULAR:
+        return "REGULAR";
+    case XQC_DEMO_WIFI_PATH_STATE_DEGRADED_CSMA:
+        return "DEGRADED_CSMA";
+    case XQC_DEMO_WIFI_PATH_STATE_UNKNOWN:
+    default:
+        return "UNKNOWN";
+    }
+}
+
+static int
+xqc_demo_cli_wifi_state_rank(xqc_demo_wifi_path_state_t state)
+{
+    switch (state) {
+    case XQC_DEMO_WIFI_PATH_STATE_REGULAR:
+        return 0;
+    case XQC_DEMO_WIFI_PATH_STATE_UNKNOWN:
+        return 1;
+    case XQC_DEMO_WIFI_PATH_STATE_DEGRADED_CSMA:
+    default:
+        return 2;
+    }
+}
+
+static xqc_demo_cli_user_path_t *
+xqc_demo_cli_find_user_path_by_id(xqc_demo_cli_user_conn_t *user_conn, uint64_t path_id)
+{
+    int i;
+
+    if (user_conn == NULL) {
+        return NULL;
+    }
+
+    for (i = 0; i < user_conn->total_path_cnt; i++) {
+        if (user_conn->paths[i].path_id == path_id) {
+            return &user_conn->paths[i];
+        }
+    }
+
+    return NULL;
+}
+
+static xqc_demo_cli_user_path_t *
+xqc_demo_cli_find_user_path_by_ifname(xqc_demo_cli_ctx_t *ctx, const char *ifname,
+    xqc_demo_cli_user_conn_t **user_conn_out)
+{
+    size_t i;
+
+    if (ctx == NULL || ifname == NULL || ifname[0] == '\0') {
+        return NULL;
+    }
+
+    for (i = 0; i < (size_t) ctx->task_ctx.task_cnt; i++) {
+        xqc_demo_cli_task_t *task = &ctx->task_ctx.tasks[i];
+        xqc_demo_cli_user_conn_t *user_conn = task->user_conn;
+        int path_idx;
+
+        if (user_conn == NULL) {
+            continue;
+        }
+
+        for (path_idx = 0; path_idx < user_conn->total_path_cnt; path_idx++) {
+            xqc_demo_cli_user_path_t *user_path = &user_conn->paths[path_idx];
+            if (strcmp(user_path->ifname, ifname) == 0) {
+                if (user_conn_out != NULL) {
+                    *user_conn_out = user_conn;
+                }
+                return user_path;
+            }
+        }
+    }
+
+    return NULL;
+}
+
+static void
+xqc_demo_cli_log_wifi_state_snapshot(xqc_demo_cli_ctx_t *ctx,
+    xqc_demo_cli_user_conn_t *user_conn, xqc_demo_cli_user_path_t *user_path,
+    const xqc_demo_wifi_state_snapshot_t *snapshot)
+{
+    char line[768];
+
+    if (ctx == NULL || snapshot == NULL || ctx->wifi_state_fd <= 0) {
+        return;
+    }
+
+    snprintf(line, sizeof(line),
+        "%"PRIu64",%p,%"PRIu64",%d,%s,%u,%s,%.6f,%.6f,%.6f,%"PRIu64",%.3f,%.3f,%.3f,%"PRIu64",%"PRIu64"",
+        snapshot->ts_us,
+        user_conn,
+        user_path ? user_path->path_id : 0,
+        user_path ? user_path->path_seq : -1,
+        snapshot->ifname[0] ? snapshot->ifname : "-",
+        snapshot->ifindex,
+        xqc_demo_cli_wifi_state_label(snapshot->state),
+        snapshot->pi_degraded,
+        snapshot->p_long_gap,
+        snapshot->r_eff_Bpus,
+        snapshot->last_gap_us,
+        snapshot->ewma_gap_us,
+        snapshot->ewma_airtime_us,
+        snapshot->ewma_burst_bytes,
+        snapshot->sample_count,
+        snapshot->last_update_ts_us);
+    xqc_demo_cli_write_aux_line(ctx->wifi_state_fd, line);
+}
+
+static void
+xqc_demo_cli_wifi_state_update_cb(const xqc_demo_wifi_state_snapshot_t *snapshot,
+    void *user_data)
+{
+    xqc_demo_cli_ctx_t *ctx = user_data;
+    xqc_demo_cli_user_conn_t *user_conn = NULL;
+    xqc_demo_cli_user_path_t *user_path;
+
+    if (ctx == NULL || snapshot == NULL) {
+        return;
+    }
+
+    user_path = xqc_demo_cli_find_user_path_by_ifname(ctx, snapshot->ifname, &user_conn);
+    xqc_demo_cli_log_wifi_state_snapshot(ctx, user_conn, user_path, snapshot);
+}
+
+static void
+xqc_demo_cli_scheduler_observer_cb(const xqc_scheduler_observation_t *observation,
+    void *user_data)
+{
+    typedef struct xqc_demo_cli_sched_row_path_s {
+        int present;
+        uint64_t path_id;
+        const char *ifname;
+        unsigned int ifindex;
+        uint64_t srtt_us;
+        uint64_t cwnd_bytes;
+        uint64_t bytes_in_flight;
+        uint8_t can_send;
+        uint8_t path_state;
+        uint8_t app_path_status;
+        xqc_demo_wifi_state_snapshot_t wifi_snapshot;
+        int has_wifi_snapshot;
+    } xqc_demo_cli_sched_row_path_t;
+
+    xqc_demo_cli_ctx_t *ctx = user_data;
+    xqc_demo_cli_user_conn_t *user_conn;
+    xqc_demo_cli_sched_row_path_t rows[MAX_PATH_CNT];
+    int row_count = 0;
+    int selected_idx = -1;
+    int selected_on_degraded = 0;
+    int other_cleaner = 0;
+    int i;
+    char line[2048];
+    const char *selected_ifname = "-";
+    unsigned int selected_ifindex = 0;
+
+    if (ctx == NULL || observation == NULL || ctx->scheduler_trace_fd <= 0) {
+        return;
+    }
+
+    user_conn = observation->conn_user_data;
+    memset(rows, 0, sizeof(rows));
+
+    for (i = 0; i < observation->path_count && row_count < MAX_PATH_CNT; i++) {
+        xqc_scheduler_path_snapshot_t *src = (xqc_scheduler_path_snapshot_t *) &observation->paths[i];
+        xqc_demo_cli_user_path_t *user_path = xqc_demo_cli_find_user_path_by_id(user_conn, src->path_id);
+        int slot = row_count;
+
+        if (user_path != NULL && user_path->path_seq >= 0 && user_path->path_seq < MAX_PATH_CNT) {
+            slot = user_path->path_seq;
+        } else {
+            while (slot < MAX_PATH_CNT && rows[slot].present) {
+                slot++;
+            }
+            if (slot >= MAX_PATH_CNT) {
+                continue;
+            }
+        }
+
+        rows[slot].present = 1;
+        rows[slot].path_id = src->path_id;
+        rows[slot].ifname = (user_path && user_path->ifname[0]) ? user_path->ifname : "-";
+        rows[slot].ifindex = user_path ? user_path->ifindex : 0;
+        rows[slot].srtt_us = src->srtt_us;
+        rows[slot].cwnd_bytes = src->cwnd_bytes;
+        rows[slot].bytes_in_flight = src->bytes_in_flight;
+        rows[slot].can_send = src->can_send;
+        rows[slot].path_state = src->path_state;
+        rows[slot].app_path_status = src->app_path_status;
+
+        if (ctx->wifi_monitor != NULL && user_path != NULL && user_path->ifname[0] != '\0'
+            && xqc_demo_wifi_monitor_get_snapshot(ctx->wifi_monitor, user_path->ifname,
+                &rows[slot].wifi_snapshot) == 0)
+        {
+            rows[slot].has_wifi_snapshot = 1;
+        }
+
+        if (observation->has_selected_path && observation->selected_path_id == src->path_id) {
+            selected_idx = slot;
+            selected_ifname = rows[slot].ifname;
+            selected_ifindex = rows[slot].ifindex;
+        }
+
+        if (slot + 1 > row_count) {
+            row_count = slot + 1;
+        }
+    }
+
+    if (selected_idx >= 0 && selected_idx < MAX_PATH_CNT
+        && rows[selected_idx].has_wifi_snapshot)
+    {
+        selected_on_degraded =
+            rows[selected_idx].wifi_snapshot.state == XQC_DEMO_WIFI_PATH_STATE_DEGRADED_CSMA;
+
+        for (i = 0; i < MAX_PATH_CNT; i++) {
+            int selected_rank;
+            int other_rank;
+
+            if (i == selected_idx || !rows[i].present || !rows[i].has_wifi_snapshot) {
+                continue;
+            }
+
+            selected_rank = xqc_demo_cli_wifi_state_rank(rows[selected_idx].wifi_snapshot.state);
+            other_rank = xqc_demo_cli_wifi_state_rank(rows[i].wifi_snapshot.state);
+            if (other_rank < selected_rank
+                || (other_rank == selected_rank
+                    && rows[i].wifi_snapshot.pi_degraded
+                        + 1e-9 < rows[selected_idx].wifi_snapshot.pi_degraded))
+            {
+                other_cleaner = 1;
+                break;
+            }
+        }
+    }
+
+    snprintf(line, sizeof(line),
+        "%"PRIu64",%p,%s,%"PRIu64",%s,%u,%d,%d,"
+        "%"PRIu64",%s,%u,%"PRIu64",%"PRIu64",%"PRIu64",%u,%u,%u,%s,%.6f,%.6f,%"PRIu64",%.6f,"
+        "%"PRIu64",%s,%u,%"PRIu64",%"PRIu64",%"PRIu64",%u,%u,%u,%s,%.6f,%.6f,%"PRIu64",%.6f",
+        observation->ts_us,
+        user_conn,
+        observation->scheduler_name ? observation->scheduler_name : "-",
+        observation->has_selected_path ? observation->selected_path_id : 0,
+        selected_ifname,
+        selected_ifindex,
+        selected_on_degraded,
+        other_cleaner,
+        rows[0].path_id,
+        rows[0].ifname ? rows[0].ifname : "-",
+        rows[0].ifindex,
+        rows[0].srtt_us,
+        rows[0].cwnd_bytes,
+        rows[0].bytes_in_flight,
+        rows[0].can_send,
+        rows[0].path_state,
+        rows[0].app_path_status,
+        rows[0].has_wifi_snapshot ? xqc_demo_cli_wifi_state_label(rows[0].wifi_snapshot.state) : "UNKNOWN",
+        rows[0].has_wifi_snapshot ? rows[0].wifi_snapshot.pi_degraded : 0.0,
+        rows[0].has_wifi_snapshot ? rows[0].wifi_snapshot.p_long_gap : 0.0,
+        rows[0].has_wifi_snapshot ? rows[0].wifi_snapshot.last_gap_us : 0,
+        rows[0].has_wifi_snapshot ? rows[0].wifi_snapshot.r_eff_Bpus : 0.0,
+        rows[1].path_id,
+        rows[1].ifname ? rows[1].ifname : "-",
+        rows[1].ifindex,
+        rows[1].srtt_us,
+        rows[1].cwnd_bytes,
+        rows[1].bytes_in_flight,
+        rows[1].can_send,
+        rows[1].path_state,
+        rows[1].app_path_status,
+        rows[1].has_wifi_snapshot ? xqc_demo_cli_wifi_state_label(rows[1].wifi_snapshot.state) : "UNKNOWN",
+        rows[1].has_wifi_snapshot ? rows[1].wifi_snapshot.pi_degraded : 0.0,
+        rows[1].has_wifi_snapshot ? rows[1].wifi_snapshot.p_long_gap : 0.0,
+        rows[1].has_wifi_snapshot ? rows[1].wifi_snapshot.last_gap_us : 0,
+        rows[1].has_wifi_snapshot ? rows[1].wifi_snapshot.r_eff_Bpus : 0.0);
+    xqc_demo_cli_write_aux_line(ctx->scheduler_trace_fd, line);
+}
+
+static void
+xqc_demo_cli_resolve_monitor_paths(xqc_demo_cli_ctx_t *ctx)
+{
+    const char *env_out_dir;
+    const char *env_cfg_path;
+    const char *last_slash;
+    size_t prefix_len;
+
+    if (ctx == NULL || ctx->args == NULL) {
+        return;
+    }
+
+    env_out_dir = getenv("XQC_WIFI_MONITOR_OUT_DIR");
+    env_cfg_path = getenv("XQC_WIFI_MONITOR_CONFIG");
+
+    if (env_out_dir && env_out_dir[0] != '\0') {
+        snprintf(ctx->wifi_monitor_output_dir, sizeof(ctx->wifi_monitor_output_dir), "%s",
+            env_out_dir);
+    } else {
+        last_slash = strrchr(ctx->log_path, '/');
+        if (last_slash == NULL) {
+            snprintf(ctx->wifi_monitor_output_dir, sizeof(ctx->wifi_monitor_output_dir), ".");
+        } else {
+            prefix_len = (size_t) (last_slash - ctx->log_path);
+            if (prefix_len >= sizeof(ctx->wifi_monitor_output_dir)) {
+                prefix_len = sizeof(ctx->wifi_monitor_output_dir) - 1;
+            }
+            memcpy(ctx->wifi_monitor_output_dir, ctx->log_path, prefix_len);
+            ctx->wifi_monitor_output_dir[prefix_len] = '\0';
+        }
+    }
+
+    if (env_cfg_path && env_cfg_path[0] != '\0') {
+        snprintf(ctx->wifi_monitor_config_path, sizeof(ctx->wifi_monitor_config_path), "%s",
+            env_cfg_path);
+    } else {
+        snprintf(ctx->wifi_monitor_config_path, sizeof(ctx->wifi_monitor_config_path),
+            "%s", "ebpf-wifi-insider/config.json");
+    }
+}
+
+static void
+xqc_demo_cli_init_monitoring(xqc_demo_cli_ctx_t *ctx)
+{
+    xqc_demo_wifi_monitor_config_t monitor_cfg;
+    int should_start = 0;
+
+    if (ctx == NULL || ctx->args == NULL) {
+        return;
+    }
+
+    xqc_scheduler_register_observer(xqc_demo_cli_scheduler_observer_cb, ctx);
+    xqc_demo_cli_resolve_monitor_paths(ctx);
+
+#ifndef XQC_SYS_WINDOWS
+    should_start = ctx->args->net_cfg.multipath && ctx->args->net_cfg.ifcnt >= 2;
+#endif
+    if (!should_start) {
+        return;
+    }
+
+    memset(&monitor_cfg, 0, sizeof(monitor_cfg));
+    monitor_cfg.output_dir = ctx->wifi_monitor_output_dir;
+    monitor_cfg.config_path = ctx->wifi_monitor_config_path;
+    monitor_cfg.ifname_primary = ctx->args->net_cfg.iflist[0];
+    monitor_cfg.ifname_secondary = ctx->args->net_cfg.ifcnt > 1
+        ? ctx->args->net_cfg.iflist[1] : NULL;
+    monitor_cfg.state_update_cb = xqc_demo_cli_wifi_state_update_cb;
+    monitor_cfg.state_update_user_data = ctx;
+
+    if (xqc_demo_wifi_monitor_start(&ctx->wifi_monitor, &monitor_cfg) != 0) {
+        printf("wifi monitor start failed\n");
+        ctx->wifi_monitor = NULL;
+        return;
+    }
+
+    printf("wifi monitor started, output_dir=%s config=%s if0=%s if1=%s\n",
+        ctx->wifi_monitor_output_dir,
+        ctx->wifi_monitor_config_path,
+        monitor_cfg.ifname_primary ? monitor_cfg.ifname_primary : "-",
+        monitor_cfg.ifname_secondary ? monitor_cfg.ifname_secondary : "-");
+}
+
+static void
+xqc_demo_cli_shutdown_monitoring(xqc_demo_cli_ctx_t *ctx)
+{
+    if (ctx == NULL) {
+        return;
+    }
+
+    xqc_scheduler_unregister_observer();
+
+    if (ctx->wifi_monitor != NULL) {
+        xqc_demo_wifi_monitor_stop(ctx->wifi_monitor);
+        ctx->wifi_monitor = NULL;
+    }
+}
 
 void
 xqc_demo_cli_send_requests(xqc_demo_cli_user_conn_t *user_conn, 
@@ -815,6 +1618,8 @@ xqc_demo_cli_write_socket_ex(uint64_t path_id, const unsigned char *buf, size_t 
             if (get_sys_errno() == EAGAIN) {
                 res = XQC_SOCKET_EAGAIN;
             }
+        } else {
+            xqc_demo_cli_log_send_trace(user_path, buf, (size_t)res);
         }
         user_path->last_sock_op_time = xqc_now();
     } while ((res < 0) && (get_sys_errno() == EINTR));
@@ -2828,7 +3633,9 @@ xqc_demo_cli_init_ctx(xqc_demo_cli_ctx_t *pctx, xqc_demo_cli_client_args_t *args
     snprintf(pctx->log_path, sizeof(pctx->log_path), "%s", args->env_cfg.log_path);
     pctx->args = args;
     xqc_demo_cli_open_log_file(pctx);
+    xqc_demo_cli_open_aux_trace_files(pctx);
     xqc_demo_cli_open_keylog_file(pctx);
+    xqc_demo_cli_init_monitoring(pctx);
 }
 
 
@@ -2943,6 +3750,18 @@ xqc_demo_cli_init_user_path(xqc_demo_cli_user_conn_t *user_conn, int path_seq, u
     xqc_demo_cli_ctx_t *ctx = user_conn->ctx;
     xqc_demo_cli_user_path_t *user_path = &user_conn->paths[path_seq];
 
+    user_path->path_seq = path_seq;
+    if (ctx->args->net_cfg.ifcnt > path_seq) {
+        strncpy(user_path->ifname, ctx->args->net_cfg.iflist[path_seq],
+            sizeof(user_path->ifname) - 1);
+        user_path->ifname[sizeof(user_path->ifname) - 1] = '\0';
+    } else {
+        snprintf(user_path->ifname, sizeof(user_path->ifname), "path%d", path_seq);
+    }
+#ifndef XQC_SYS_WINDOWS
+    user_path->ifindex = if_nametoindex(user_path->ifname);
+#endif
+
     /* create the initial path */
     user_path->fd = xqc_demo_cli_create_socket(user_path, &ctx->args->net_cfg, path_seq);
     if (user_path->fd < 0) {
@@ -2994,6 +3813,9 @@ xqc_demo_cli_init_user_path(xqc_demo_cli_user_conn_t *user_conn, int path_seq, u
     user_path->path_id = path_id;
 
     printf("No.%d path created id = %"PRIu64"\n", user_conn->total_path_cnt - 1, path_id);
+    printf("path map: path_id=%"PRIu64" path_seq=%d ifname=%s ifindex=%u fd=%d\n",
+        path_id, user_path->path_seq, user_path->ifname, user_path->ifindex, user_path->fd);
+    xqc_demo_cli_log_path_map(user_conn, user_path);
 
     return 0;
 }
@@ -3164,6 +3986,8 @@ xqc_demo_cli_start_task_manager(xqc_demo_cli_ctx_t *ctx)
 void
 xqc_demo_cli_free_ctx(xqc_demo_cli_ctx_t *ctx)
 {
+    xqc_demo_cli_shutdown_monitoring(ctx);
+    xqc_demo_cli_close_aux_trace_files(ctx);
     xqc_demo_cli_close_keylog_file(ctx);
     xqc_demo_cli_close_log_file(ctx);
 
@@ -3202,6 +4026,7 @@ main(int argc, char *argv[])
 
     event_base_dispatch(ctx->eb);
 
+    xqc_demo_cli_shutdown_monitoring(ctx);
     xqc_engine_destroy(ctx->engine);
     xqc_demo_cli_free_ctx(ctx);
     return 0;

@@ -5,6 +5,7 @@
 
 #include "src/transport/scheduler/xqc_scheduler_backup.h"
 #include "src/transport/scheduler/xqc_scheduler_common.h"
+#include "src/transport/scheduler/xqc_scheduler_observer.h"
 #include "src/transport/xqc_send_ctl.h"
 
 
@@ -27,6 +28,7 @@ xqc_backup_scheduler_get_path(void *scheduler, xqc_connection_t *conn,
     xqc_bool_t *cc_blocked)
 {
     xqc_path_ctx_t *best_path[XQC_PATH_CLASS_PERF_CLASS_SIZE];
+    xqc_scheduler_observation_t observation;
     xqc_bool_t has_path[XQC_PATH_CLASS_PERF_CLASS_SIZE];
     xqc_path_perf_class_t path_class;
     xqc_bool_t available_path_exists;
@@ -44,6 +46,10 @@ xqc_backup_scheduler_get_path(void *scheduler, xqc_connection_t *conn,
         *cc_blocked = XQC_FALSE;
     }
 
+    xqc_scheduler_observation_init(&observation, "backup", conn,
+        conn->user_data, packet_out->po_pkt.pkt_num, packet_out->po_used_size);
+    observation.ts_us = xqc_monotonic_timestamp();
+
     for (path_class = XQC_PATH_CLASS_AVAILABLE_HIGH; 
          path_class < XQC_PATH_CLASS_PERF_CLASS_SIZE; 
          path_class++)
@@ -56,6 +62,12 @@ xqc_backup_scheduler_get_path(void *scheduler, xqc_connection_t *conn,
         path = xqc_list_entry(pos, xqc_path_ctx_t, path_list);
 
         path_class = xqc_path_get_perf_class(path);
+        xqc_scheduler_observation_append_path(&observation, path->path_id,
+            xqc_send_ctl_get_srtt(path->path_send_ctl),
+            path->path_send_ctl->ctl_cong_callback->
+                xqc_cong_ctl_get_cwnd(path->path_send_ctl->ctl_cong),
+            path->path_send_ctl->ctl_bytes_in_flight, 0,
+            path->path_state, path->app_path_status, path_class);
 
         /* skip inactive paths */
         /* skip frozen paths */
@@ -75,6 +87,11 @@ xqc_backup_scheduler_get_path(void *scheduler, xqc_connection_t *conn,
 
         has_path[path_class] = XQC_TRUE;
         path_can_send = xqc_scheduler_check_path_can_send(path, packet_out, check_cwnd);
+        if (observation.path_count > 0
+            && observation.paths[observation.path_count - 1].path_id == path->path_id)
+        {
+            observation.paths[observation.path_count - 1].can_send = path_can_send;
+        }
 
         if (!path_can_send) {
             goto skip_path;
@@ -127,6 +144,9 @@ skip_path:
                 continue;
 
             } else {
+                observation.has_selected_path = 1;
+                observation.selected_path_id = best_path[path_class]->path_id;
+                xqc_scheduler_notify_observer(&observation);
                 xqc_log(conn->log, XQC_LOG_DEBUG, "|best path:%ui|frame_type:%s|"
                         "pn:%ui|size:%ud|reinj:%d|path_class:%d|",
                         best_path[path_class]->path_id, 
@@ -138,6 +158,7 @@ skip_path:
         }
     }
 
+    xqc_scheduler_notify_observer(&observation);
     xqc_log(conn->log, XQC_LOG_DEBUG, 
             "|No available paths to schedule|conn:%p|", conn);
     return NULL;

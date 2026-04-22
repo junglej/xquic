@@ -20,6 +20,7 @@ option (XQC_ENABLE_XOR "enable fec scheme xor" OFF)
 option (XQC_ENABLE_RSC "enable fec scheme reed-solomon code" OFF)
 option (XQC_ENABLE_PKM "enable fec scheme packet mask" OFF)
 option (XQC_PING_ATTACK_PROTECT "enable ping attack protection" OFF)
+option (XQC_ENABLE_WIFI_MONITOR "enable eBPF Wi-Fi monitor component" ON)
 
 if(NOT CMAKE_BUILD_TYPE)
     set(CMAKE_BUILD_TYPE Release)
@@ -136,6 +137,38 @@ include_directories(include
     ${CMAKE_SOURCE_DIR}
 )
 
+if(XQC_ENABLE_WIFI_MONITOR AND NOT CMAKE_SYSTEM_NAME MATCHES "Windows")
+    set(XQC_WIFI_MONITOR_DIR "${CMAKE_SOURCE_DIR}/../ebpf-wifi-insider")
+    set(XQC_WIFI_MONITOR_OUTPUT "${XQC_WIFI_MONITOR_DIR}/.output")
+    set(XQC_WIFI_MONITOR_SKEL "${XQC_WIFI_MONITOR_OUTPUT}/monitor.skel.h")
+    set(XQC_WIFI_MONITOR_LIBBPF "${XQC_WIFI_MONITOR_OUTPUT}/libbpf.a")
+
+    include_directories(
+        "${XQC_WIFI_MONITOR_DIR}"
+        "${XQC_WIFI_MONITOR_OUTPUT}"
+        "${CMAKE_SOURCE_DIR}/../Lib/libbpf/include/uapi"
+        "${CMAKE_SOURCE_DIR}/../Lib/libbpf/src"
+        "${CMAKE_SOURCE_DIR}/../Lib/wpa_ctrl"
+    )
+
+    add_custom_command(
+        OUTPUT "${XQC_WIFI_MONITOR_SKEL}" "${XQC_WIFI_MONITOR_LIBBPF}"
+        COMMAND ${CMAKE_MAKE_PROGRAM} -C "${XQC_WIFI_MONITOR_DIR}" .output/monitor.skel.h .output/libbpf.a
+        DEPENDS
+            "${XQC_WIFI_MONITOR_DIR}/monitor.c"
+            "${XQC_WIFI_MONITOR_DIR}/monitor.bpf.c"
+            "${XQC_WIFI_MONITOR_DIR}/monitor.h"
+        VERBATIM
+    )
+
+    add_custom_target(xqc_wifi_monitor_assets
+        DEPENDS "${XQC_WIFI_MONITOR_SKEL}" "${XQC_WIFI_MONITOR_LIBBPF}")
+
+    set(XQC_WIFI_MONITOR_LINK_LIBS
+        "${XQC_WIFI_MONITOR_LIBBPF};elf;z"
+        CACHE INTERNAL "Link libraries required by the Wi-Fi monitor")
+endif()
+
 
 
 # print tls traffic secret in keylog
@@ -235,11 +268,21 @@ set(
     "src/transport/reinjection_control/xqc_reinj_deadline.c"
     "src/transport/reinjection_control/xqc_reinj_dgram.c"
     "src/transport/scheduler/xqc_scheduler_minrtt.c"
+    "src/transport/scheduler/xqc_scheduler_observer.c"
     "src/transport/scheduler/xqc_scheduler_common.c"
     "src/transport/scheduler/xqc_scheduler_backup.c"
     "src/transport/scheduler/xqc_scheduler_backup_fec.c"
     "src/transport/scheduler/xqc_scheduler_rap.c"
 )
+
+if(XQC_ENABLE_WIFI_MONITOR AND NOT CMAKE_SYSTEM_NAME MATCHES "Windows")
+    set(
+        TRANSPORT_SOURCES
+        ${TRANSPORT_SOURCES}
+        "src/transport/monitor/xqc_wifi_monitor.c"
+        "${CMAKE_SOURCE_DIR}/../Lib/wpa_ctrl/wpa_ctrl.c"
+    )
+endif()
 
 if(XQC_ENABLE_MP_INTEROP)
     set(
@@ -405,6 +448,11 @@ add_library(
     ${XQC_SOURCE}
 )
 
+if(XQC_ENABLE_WIFI_MONITOR AND NOT CMAKE_SYSTEM_NAME MATCHES "Windows")
+    add_dependencies(xquic-static xqc_wifi_monitor_assets)
+    add_dependencies(xquic xqc_wifi_monitor_assets)
+endif()
+
 if(PLATFORM MATCHES "mac")
     target_link_libraries(
         xquic
@@ -424,10 +472,18 @@ else()
     )
 endif()
 
+if(XQC_ENABLE_WIFI_MONITOR AND NOT CMAKE_SYSTEM_NAME MATCHES "Windows")
+    target_link_libraries(
+        xquic
+        "${XQC_WIFI_MONITOR_LIBBPF}"
+        elf
+        z
+    )
+endif()
+
 
 # Strip binary for release builds
 if(CMAKE_BUILD_TYPE STREQUAL MinSizeRel)
     add_custom_command(TARGET ${PROJECT_NAME} POST_BUILD
             COMMAND ${CMAKE_STRIP} libxquic.so)
 endif()
-

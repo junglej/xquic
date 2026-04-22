@@ -4,6 +4,7 @@
 
 #include "src/transport/scheduler/xqc_scheduler_interop.h"
 #include "src/transport/scheduler/xqc_scheduler_common.h"
+#include "src/transport/scheduler/xqc_scheduler_observer.h"
 #include "src/transport/xqc_send_ctl.h"
 
 
@@ -26,6 +27,7 @@ xqc_interop_scheduler_get_path(void *scheduler,
 {
     xqc_path_ctx_t *best_path = NULL;
     xqc_path_ctx_t *best_standby_path = NULL;
+    xqc_scheduler_observation_t observation;
 
     xqc_list_head_t *pos, *next;
     xqc_path_ctx_t *path;
@@ -43,8 +45,18 @@ xqc_interop_scheduler_get_path(void *scheduler,
         *cc_blocked = XQC_FALSE;
     }
 
+    xqc_scheduler_observation_init(&observation, "interop", conn,
+        conn->user_data, packet_out->po_pkt.pkt_num, packet_out->po_used_size);
+    observation.ts_us = xqc_monotonic_timestamp();
+
     xqc_list_for_each_safe(pos, next, &conn->conn_paths_list) {
         path = xqc_list_entry(pos, xqc_path_ctx_t, path_list);
+        xqc_scheduler_observation_append_path(&observation, path->path_id,
+            xqc_send_ctl_get_srtt(path->path_send_ctl),
+            path->path_send_ctl->ctl_cong_callback->
+                xqc_cong_ctl_get_cwnd(path->path_send_ctl->ctl_cong),
+            path->path_send_ctl->ctl_bytes_in_flight, 0,
+            path->path_state, path->app_path_status, 0);
 
         if (path->path_state != XQC_PATH_STATE_ACTIVE) {
             continue;
@@ -67,6 +79,12 @@ xqc_interop_scheduler_get_path(void *scheduler,
 
         if (!xqc_scheduler_check_path_can_send(path, packet_out, check_cwnd)) {
             continue;
+        }
+
+        if (observation.path_count > 0
+            && observation.paths[observation.path_count - 1].path_id == path->path_id)
+        {
+            observation.paths[observation.path_count - 1].can_send = 1;
         }
 
         if (cc_blocked) {
@@ -100,11 +118,14 @@ xqc_interop_scheduler_get_path(void *scheduler,
     }
 
     if (best_path) {
+        observation.has_selected_path = 1;
+        observation.selected_path_id = best_path->path_id;
         xqc_log(conn->log, XQC_LOG_DEBUG, "|best path:%ui|frame_type:%s|app_status:%d|",
                 best_path->path_id, xqc_frame_type_2_str(conn->engine, packet_out->po_frame_types),
                 best_path->app_path_status);
     }
 
+    xqc_scheduler_notify_observer(&observation);
     return best_path;
 }
 
