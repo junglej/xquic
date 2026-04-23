@@ -6,6 +6,7 @@
 #include <stdio.h>
 #include <errno.h>
 #include <memory.h>
+#include <string.h>
 #include <stdlib.h>
 #include <event2/event.h>
 #include <inttypes.h>
@@ -19,6 +20,7 @@
 
 #include "platform.h"
 #include "src/common/xqc_common.h"
+#include "src/transport/xqc_stream.h"
 
 #ifndef XQC_SYS_WINDOWS
 #include <unistd.h>
@@ -175,6 +177,69 @@ static uint64_t last_snd_ts;
 static FILE *g_request_trace_fp = NULL;
 static char g_request_trace_path[512];
 static int g_request_trace_disabled = 0;
+static uint64_t g_request_trace_sample_us = 100000;
+static int g_request_trace_full = 0;
+static FILE *g_stream_trace_fp = NULL;
+static char g_stream_trace_path[512];
+static int g_stream_trace_disabled = 0;
+static uint64_t g_stream_trace_sample_us = 100000;
+static int g_stream_trace_full = 0;
+
+#define XQC_SERVER_STREAM_TRACE_FLAG_FIN 0x1u
+
+typedef struct xqc_server_request_trace_state_s {
+    uint64_t stream_id;
+    xqc_usec_t last_log_ts;
+    uint64_t last_recv_body_size;
+    uint64_t last_next_read_offset;
+    uint64_t last_merged_offset_end;
+    int last_seen_abnormal;
+    struct xqc_server_request_trace_state_s *next;
+} xqc_server_request_trace_state_t;
+
+static xqc_server_request_trace_state_t *g_request_trace_states = NULL;
+
+typedef struct xqc_server_stream_trace_state_s {
+    uint64_t stream_id;
+    xqc_usec_t last_log_ts;
+    uint64_t last_recv_body_size;
+    uint64_t last_next_read_offset;
+    uint64_t last_merged_offset_end;
+    int last_seen_abnormal;
+    struct xqc_server_stream_trace_state_s *next;
+} xqc_server_stream_trace_state_t;
+
+typedef struct xqc_server_stream_trace_stats_s {
+    uint64_t stream_id;
+    uint64_t recv_body_size;
+    uint64_t send_body_size;
+    int stream_err;
+    int mp_state;
+    uint64_t recv_stream_next_read_offset;
+    uint64_t recv_stream_merged_offset_end;
+    uint64_t recv_stream_max_offset_seen;
+    uint64_t recv_stream_contiguous_buffered_bytes;
+    uint64_t recv_stream_out_of_order_bytes;
+    uint64_t recv_stream_gap_bytes;
+    uint32_t recv_stream_out_of_order_ranges;
+    uint64_t h3_body_buf_count;
+    uint64_t h3_body_buf_bytes;
+    size_t body_recvd_final_size;
+    xqc_usec_t create_time;
+    xqc_usec_t blocked_time;
+    xqc_usec_t unblocked_time;
+    xqc_usec_t header_begin_time;
+    xqc_usec_t body_begin_time;
+    xqc_usec_t fin_time;
+    xqc_usec_t end_time;
+    xqc_usec_t first_pkt_rcv_time;
+    xqc_usec_t close_time;
+    xqc_msec_t cwnd_blocked_ms;
+    uint32_t retrans_cnt;
+    uint32_t sent_pkt_cnt;
+} xqc_server_stream_trace_stats_t;
+
+static xqc_server_stream_trace_state_t *g_stream_trace_states = NULL;
 
 
 #define XQC_TEST_LONG_HEADER_LEN 32769
@@ -271,6 +336,105 @@ xqc_server_close_request_trace(void)
     }
 }
 
+static xqc_server_request_trace_state_t *
+xqc_server_find_request_trace_state(uint64_t stream_id)
+{
+    xqc_server_request_trace_state_t *state = g_request_trace_states;
+
+    while (state != NULL) {
+        if (state->stream_id == stream_id) {
+            return state;
+        }
+        state = state->next;
+    }
+
+    state = calloc(1, sizeof(*state));
+    if (state == NULL) {
+        return NULL;
+    }
+
+    state->stream_id = stream_id;
+    state->next = g_request_trace_states;
+    g_request_trace_states = state;
+    return state;
+}
+
+static void
+xqc_server_reset_request_trace_states(void)
+{
+    xqc_server_request_trace_state_t *state = g_request_trace_states;
+
+    while (state != NULL) {
+        xqc_server_request_trace_state_t *next = state->next;
+        free(state);
+        state = next;
+    }
+
+    g_request_trace_states = NULL;
+}
+
+static int
+xqc_server_should_log_request_snapshot(const xqc_request_stats_t *stats, const char *event,
+    xqc_request_notify_flag_t flag, xqc_usec_t now)
+{
+    xqc_server_request_trace_state_t *state;
+    int is_abnormal;
+    int should_log = 0;
+    int progressed;
+    int was_abnormal;
+
+    if (stats == NULL || event == NULL) {
+        return 0;
+    }
+
+    if (g_request_trace_full) {
+        return 1;
+    }
+
+    state = xqc_server_find_request_trace_state(stats->stream_id);
+    if (state == NULL) {
+        return 1;
+    }
+
+    is_abnormal = (stats->recv_stream_gap_bytes > 0 || stats->recv_stream_out_of_order_bytes > 0);
+    was_abnormal = state->last_seen_abnormal;
+    progressed = (stats->recv_body_size != state->last_recv_body_size)
+        || (stats->recv_stream_next_read_offset != state->last_next_read_offset)
+        || (stats->recv_stream_merged_offset_end != state->last_merged_offset_end);
+
+    if (state->last_log_ts == 0) {
+        should_log = 1;
+    }
+
+    if (strcmp(event, "close_notify") == 0) {
+        should_log = 1;
+    }
+
+    if ((flag & (XQC_REQ_NOTIFY_READ_HEADER | XQC_REQ_NOTIFY_READ_TRAILER | XQC_REQ_NOTIFY_READ_EMPTY_FIN)) != 0) {
+        should_log = 1;
+    }
+
+    if (is_abnormal || (was_abnormal && !is_abnormal)) {
+        should_log = 1;
+    }
+
+    if (!should_log && progressed && g_request_trace_sample_us > 0
+        && now >= state->last_log_ts + g_request_trace_sample_us)
+    {
+        should_log = 1;
+    }
+
+    state->last_seen_abnormal = is_abnormal;
+    if (should_log) {
+        state->last_log_ts = now;
+        state->last_recv_body_size = stats->recv_body_size;
+        state->last_next_read_offset = stats->recv_stream_next_read_offset;
+        state->last_merged_offset_end = stats->recv_stream_merged_offset_end;
+    }
+
+    return should_log;
+}
+
 static void
 xqc_server_log_request_snapshot(xqc_h3_request_t *h3_request, const char *event,
     xqc_request_notify_flag_t flag, ssize_t app_read_bytes)
@@ -292,6 +456,10 @@ xqc_server_log_request_snapshot(xqc_h3_request_t *h3_request, const char *event,
     now = xqc_now();
     create_time = stats.h3r_begin_time;
     request_elapsed_ms = create_time ? xqc_calc_delay(now, create_time) / 1000 : 0;
+
+    if (!xqc_server_should_log_request_snapshot(&stats, event, flag, now)) {
+        return;
+    }
 
     fprintf(g_request_trace_fp,
             "%"PRIu64",%"PRIu64",%s,%u,%zd,"
@@ -316,6 +484,334 @@ xqc_server_log_request_snapshot(xqc_h3_request_t *h3_request, const char *event,
             xqc_calc_delay(stats.stream_fst_pkt_rcv_time, create_time),
             stats.stream_close_delay, stats.cwnd_blocked_ms, stats.retrans_cnt,
             stats.sent_pkt_cnt);
+}
+
+static uint64_t
+xqc_server_safe_delay(xqc_usec_t later, xqc_usec_t earlier)
+{
+    if (later == 0 || earlier == 0 || later < earlier) {
+        return 0;
+    }
+
+    return later - earlier;
+}
+
+static int
+xqc_server_prepare_stream_trace(void)
+{
+    long file_size;
+
+    if (g_stream_trace_disabled) {
+        return -1;
+    }
+
+    if (g_stream_trace_fp != NULL) {
+        return 0;
+    }
+
+    if (xqc_server_build_sibling_path(g_log_path, "server_stream_trace.csv",
+                                      g_stream_trace_path, sizeof(g_stream_trace_path)) != 0)
+    {
+        printf("stream trace path build failed\n");
+        g_stream_trace_disabled = 1;
+        return -1;
+    }
+
+    g_stream_trace_fp = fopen(g_stream_trace_path, "a");
+    if (g_stream_trace_fp == NULL) {
+        printf("open stream trace failed: %s\n", g_stream_trace_path);
+        g_stream_trace_disabled = 1;
+        return -1;
+    }
+
+    setvbuf(g_stream_trace_fp, NULL, _IOLBF, 0);
+    if (fseek(g_stream_trace_fp, 0, SEEK_END) != 0) {
+        file_size = -1;
+    } else {
+        file_size = ftell(g_stream_trace_fp);
+    }
+
+    if (file_size == 0) {
+        fprintf(g_stream_trace_fp,
+                "ts_us,request_elapsed_ms,event,notify_flag,app_read_bytes,"
+                "stream_id,recv_body_size,send_body_size,stream_err,mp_state,"
+                "recv_next_read_offset,recv_merged_offset_end,recv_max_offset_seen,"
+                "recv_contiguous_buffered_bytes,recv_out_of_order_bytes,recv_gap_bytes,"
+                "recv_out_of_order_ranges,h3_body_buf_count,h3_body_buf_bytes,"
+                "body_recvd_final_size,blocked_delay_us,unblocked_delay_us,"
+                "header_begin_delay_us,body_begin_delay_us,fin_delay_us,"
+                "request_end_delay_us,first_pkt_rcv_delay_us,stream_close_delay_us,"
+                "cwnd_blocked_ms,retrans_cnt,sent_pkt_cnt\n");
+        fflush(g_stream_trace_fp);
+    }
+
+    return 0;
+}
+
+static void
+xqc_server_close_stream_trace(void)
+{
+    if (g_stream_trace_fp != NULL) {
+        fclose(g_stream_trace_fp);
+        g_stream_trace_fp = NULL;
+    }
+}
+
+static xqc_server_stream_trace_state_t *
+xqc_server_find_stream_trace_state(uint64_t stream_id)
+{
+    xqc_server_stream_trace_state_t *state = g_stream_trace_states;
+
+    while (state != NULL) {
+        if (state->stream_id == stream_id) {
+            return state;
+        }
+        state = state->next;
+    }
+
+    state = calloc(1, sizeof(*state));
+    if (state == NULL) {
+        return NULL;
+    }
+
+    state->stream_id = stream_id;
+    state->next = g_stream_trace_states;
+    g_stream_trace_states = state;
+    return state;
+}
+
+static void
+xqc_server_reset_stream_trace_states(void)
+{
+    xqc_server_stream_trace_state_t *state = g_stream_trace_states;
+
+    while (state != NULL) {
+        xqc_server_stream_trace_state_t *next = state->next;
+        free(state);
+        state = next;
+    }
+
+    g_stream_trace_states = NULL;
+}
+
+static void
+xqc_server_collect_stream_recv_stats(xqc_stream_t *stream, user_stream_t *user_stream,
+    xqc_server_stream_trace_stats_t *stats)
+{
+    xqc_stream_data_in_t *data_in;
+    xqc_list_head_t *pos;
+    uint64_t union_end = 0;
+    uint64_t recv_body_size = 0;
+    uint64_t send_body_size = 0;
+    int have_union = 0;
+    user_conn_t *user_conn;
+
+    if (stream == NULL || stats == NULL) {
+        return;
+    }
+
+    memset(stats, 0, sizeof(*stats));
+
+    stats->stream_id = stream->stream_id;
+    stats->stream_err = (int) stream->stream_err;
+    stats->create_time = stream->stream_stats.create_time;
+    stats->fin_time = stream->stream_stats.peer_fin_rcv_time;
+    stats->end_time = stream->stream_stats.peer_fin_read_time;
+    stats->first_pkt_rcv_time = stream->stream_stats.first_rcv_time;
+    stats->close_time = stream->stream_stats.close_time;
+    stats->cwnd_blocked_ms = (stream->stream_stats.sched_cwnd_blk_duration
+        + stream->stream_stats.send_cwnd_blk_duration) / 1000;
+    stats->retrans_cnt = stream->stream_stats.retrans_pkt_cnt;
+    stats->sent_pkt_cnt = stream->stream_stats.sent_pkt_cnt;
+
+    if (user_stream != NULL) {
+        recv_body_size = user_stream->recv_body_len;
+        send_body_size = user_stream->send_offset;
+    }
+
+    if (stream->stream_send_offset > send_body_size) {
+        send_body_size = stream->stream_send_offset;
+    }
+
+    data_in = &stream->stream_data_in;
+    if (data_in->next_read_offset > recv_body_size) {
+        recv_body_size = data_in->next_read_offset;
+    }
+
+    stats->recv_body_size = recv_body_size;
+    stats->send_body_size = send_body_size;
+    stats->body_recvd_final_size = data_in->stream_determined ? data_in->stream_length : 0;
+    stats->recv_stream_next_read_offset = data_in->next_read_offset;
+    stats->recv_stream_merged_offset_end = data_in->merged_offset_end;
+    stats->recv_stream_max_offset_seen = xqc_max(stream->stream_max_recv_offset,
+                                                 data_in->merged_offset_end);
+    if (data_in->merged_offset_end > data_in->next_read_offset) {
+        stats->recv_stream_contiguous_buffered_bytes = data_in->merged_offset_end
+                                                       - data_in->next_read_offset;
+    }
+
+    xqc_list_for_each(pos, &data_in->frames_tailq) {
+        xqc_stream_frame_t *frame = xqc_list_entry(pos, xqc_stream_frame_t, sf_list);
+        uint64_t range_start = frame->data_offset;
+        uint64_t range_end = frame->data_offset + frame->data_length;
+
+        if (range_end > stats->recv_stream_max_offset_seen) {
+            stats->recv_stream_max_offset_seen = range_end;
+        }
+
+        if (range_end <= data_in->merged_offset_end) {
+            continue;
+        }
+
+        range_start = xqc_max(range_start, data_in->merged_offset_end);
+        if (range_end <= range_start) {
+            continue;
+        }
+
+        if (!have_union) {
+            have_union = 1;
+            union_end = range_end;
+            stats->recv_stream_out_of_order_ranges = 1;
+            stats->recv_stream_out_of_order_bytes = range_end - range_start;
+            continue;
+        }
+
+        if (range_start <= union_end) {
+            if (range_end > union_end) {
+                stats->recv_stream_out_of_order_bytes += range_end - union_end;
+                union_end = range_end;
+            }
+
+        } else {
+            stats->recv_stream_out_of_order_ranges += 1;
+            stats->recv_stream_out_of_order_bytes += range_end - range_start;
+            union_end = range_end;
+        }
+    }
+
+    if (stats->recv_stream_max_offset_seen > data_in->merged_offset_end) {
+        uint64_t span_bytes = stats->recv_stream_max_offset_seen - data_in->merged_offset_end;
+        if (span_bytes > stats->recv_stream_out_of_order_bytes) {
+            stats->recv_stream_gap_bytes = span_bytes - stats->recv_stream_out_of_order_bytes;
+        }
+    }
+
+    user_conn = xqc_get_conn_user_data_by_stream(stream);
+    if (user_conn != NULL) {
+        xqc_conn_stats_t conn_stats = xqc_conn_get_stats(ctx.engine, &user_conn->cid);
+        stats->mp_state = conn_stats.mp_state;
+    }
+}
+
+static int
+xqc_server_should_log_stream_snapshot(const xqc_server_stream_trace_stats_t *stats,
+    const char *event, uint32_t notify_flag, xqc_usec_t now)
+{
+    xqc_server_stream_trace_state_t *state;
+    int is_abnormal;
+    int should_log = 0;
+    int progressed;
+    int was_abnormal;
+
+    if (stats == NULL || event == NULL) {
+        return 0;
+    }
+
+    if (g_stream_trace_full) {
+        return 1;
+    }
+
+    state = xqc_server_find_stream_trace_state(stats->stream_id);
+    if (state == NULL) {
+        return 1;
+    }
+
+    is_abnormal = (stats->recv_stream_gap_bytes > 0 || stats->recv_stream_out_of_order_bytes > 0);
+    was_abnormal = state->last_seen_abnormal;
+    progressed = (stats->recv_body_size != state->last_recv_body_size)
+        || (stats->recv_stream_next_read_offset != state->last_next_read_offset)
+        || (stats->recv_stream_merged_offset_end != state->last_merged_offset_end);
+
+    if (state->last_log_ts == 0) {
+        should_log = 1;
+    }
+
+    if (strcmp(event, "close_notify") == 0) {
+        should_log = 1;
+    }
+
+    if ((notify_flag & XQC_SERVER_STREAM_TRACE_FLAG_FIN) != 0) {
+        should_log = 1;
+    }
+
+    if (is_abnormal || (was_abnormal && !is_abnormal)) {
+        should_log = 1;
+    }
+
+    if (!should_log && progressed && g_stream_trace_sample_us > 0
+        && now >= state->last_log_ts + g_stream_trace_sample_us)
+    {
+        should_log = 1;
+    }
+
+    state->last_seen_abnormal = is_abnormal;
+    if (should_log) {
+        state->last_log_ts = now;
+        state->last_recv_body_size = stats->recv_body_size;
+        state->last_next_read_offset = stats->recv_stream_next_read_offset;
+        state->last_merged_offset_end = stats->recv_stream_merged_offset_end;
+    }
+
+    return should_log;
+}
+
+static void
+xqc_server_log_stream_snapshot(xqc_stream_t *stream, user_stream_t *user_stream,
+    const char *event, uint32_t notify_flag, ssize_t app_read_bytes)
+{
+    xqc_server_stream_trace_stats_t stats;
+    xqc_usec_t now;
+    uint64_t request_elapsed_ms;
+
+    if (stream == NULL || event == NULL) {
+        return;
+    }
+
+    if (xqc_server_prepare_stream_trace() != 0) {
+        return;
+    }
+
+    xqc_server_collect_stream_recv_stats(stream, user_stream, &stats);
+    now = xqc_now();
+    request_elapsed_ms = stats.create_time ? xqc_server_safe_delay(now, stats.create_time) / 1000 : 0;
+
+    if (!xqc_server_should_log_stream_snapshot(&stats, event, notify_flag, now)) {
+        return;
+    }
+
+    fprintf(g_stream_trace_fp,
+            "%"PRIu64",%"PRIu64",%s,%u,%zd,"
+            "%"PRIu64",%"PRIu64",%"PRIu64",%d,%d,"
+            "%"PRIu64",%"PRIu64",%"PRIu64",%"PRIu64",%"PRIu64",%"PRIu64",%u,"
+            "%"PRIu64",%"PRIu64",%zu,"
+            "%"PRIu64",%"PRIu64",%"PRIu64",%"PRIu64",%"PRIu64",%"PRIu64",%"PRIu64",%"PRIu64","
+            "%"PRIu64",%u,%u\n",
+            now, request_elapsed_ms, event, notify_flag, app_read_bytes,
+            stats.stream_id, stats.recv_body_size, stats.send_body_size, stats.stream_err, stats.mp_state,
+            stats.recv_stream_next_read_offset, stats.recv_stream_merged_offset_end,
+            stats.recv_stream_max_offset_seen, stats.recv_stream_contiguous_buffered_bytes,
+            stats.recv_stream_out_of_order_bytes, stats.recv_stream_gap_bytes,
+            stats.recv_stream_out_of_order_ranges, stats.h3_body_buf_count,
+            stats.h3_body_buf_bytes, stats.body_recvd_final_size,
+            xqc_server_safe_delay(stats.blocked_time, stats.create_time),
+            xqc_server_safe_delay(stats.unblocked_time, stats.create_time),
+            xqc_server_safe_delay(stats.header_begin_time, stats.create_time),
+            xqc_server_safe_delay(stats.body_begin_time, stats.create_time),
+            xqc_server_safe_delay(stats.fin_time, stats.create_time),
+            xqc_server_safe_delay(stats.end_time, stats.create_time),
+            xqc_server_safe_delay(stats.first_pkt_rcv_time, stats.create_time),
+            xqc_server_safe_delay(stats.close_time, stats.create_time),
+            stats.cwnd_blocked_ms, stats.retrans_cnt, stats.sent_pkt_cnt);
 }
 
 /*
@@ -976,6 +1472,7 @@ xqc_server_stream_close_notify(xqc_stream_t *stream, void *user_data)
 {
     DEBUG;
     user_stream_t *user_stream = (user_stream_t*)user_data;
+    xqc_server_log_stream_snapshot(stream, user_stream, "close_notify", 0, 0);
     free(user_stream->send_body);
     free(user_stream->recv_body);
     free(user_stream);
@@ -996,6 +1493,7 @@ xqc_server_stream_read_notify(xqc_stream_t *stream, void *user_data)
 {
     //DEBUG;
     unsigned char fin = 0;
+    uint32_t notify_flag = 0;
     user_stream_t *user_stream = (user_stream_t *) user_data;
 
     if (g_echo && user_stream->recv_body == NULL) {
@@ -1050,6 +1548,13 @@ xqc_server_stream_read_notify(xqc_stream_t *stream, void *user_data)
 
     // mpshell
     // printf("xqc_stream_recv read:%zd, offset:%zu, fin:%d\n", read_sum, user_stream->recv_body_len, fin);
+
+    if (fin) {
+        user_stream->recv_fin = 1;
+        notify_flag |= XQC_SERVER_STREAM_TRACE_FLAG_FIN;
+    }
+
+    xqc_server_log_stream_snapshot(stream, user_stream, "read_notify", notify_flag, read_sum);
 
     if (fin) {
         xqc_server_stream_send(stream, user_data);
@@ -2264,6 +2769,12 @@ void usage(int argc, char *argv[]) {
 "   -Q    Multipath backup path standby, set backup_mode on(1). default backup_mode is 0(off).\n"
 "   -H    Disable h3_ext.\n"
 "   -U    Send_datagram 0 (off), 1 (on), 2(on + batch).\n"
+"   --qlog_disable                Disable qlog/event logging.\n"
+"   --qlog_importance <level>     qlog importance: s|c|b|e|r.\n"
+"   --request_trace_sample_ms <n> Sample clean request trace every n ms.\n"
+"   --request_trace_full          Log every request read_notify row.\n"
+"   --stream_trace_sample_ms <n>  Sample clean transport stream trace every n ms.\n"
+"   --stream_trace_full           Log every transport stream read_notify row.\n"
 , prog);
 }
 
@@ -2313,6 +2824,10 @@ int main(int argc, char *argv[]) {
         {"pmtud", required_argument, &long_opt_index, 4},
         {"qlog_disable", no_argument, &long_opt_index, 5},
         {"qlog_importance", required_argument, &long_opt_index, 6},
+        {"request_trace_sample_ms", required_argument, &long_opt_index, 7},
+        {"request_trace_full", no_argument, &long_opt_index, 8},
+        {"stream_trace_sample_ms", required_argument, &long_opt_index, 9},
+        {"stream_trace_full", no_argument, &long_opt_index, 10},
         {0, 0, 0, 0}
     };
 
@@ -2503,6 +3018,26 @@ int main(int argc, char *argv[]) {
             case 6:
                 c_qlog_importance = optarg[0];
                 printf("option qlog importance :%s\n", optarg);
+                break;
+
+            case 7:
+                g_request_trace_sample_us = (uint64_t) atoi(optarg) * 1000;
+                printf("option request trace sample ms :%s\n", optarg);
+                break;
+
+            case 8:
+                g_request_trace_full = 1;
+                printf("option request trace full logging\n");
+                break;
+
+            case 9:
+                g_stream_trace_sample_us = (uint64_t) atoi(optarg) * 1000;
+                printf("option stream trace sample ms :%s\n", optarg);
+                break;
+
+            case 10:
+                g_stream_trace_full = 1;
+                printf("option stream trace full logging\n");
                 break;
 
             default:
@@ -2928,6 +3463,9 @@ int main(int argc, char *argv[]) {
     xqc_server_close_keylog_file(&ctx);
     xqc_server_close_log_file(&ctx);
     xqc_server_close_request_trace();
+    xqc_server_close_stream_trace();
+    xqc_server_reset_request_trace_states();
+    xqc_server_reset_stream_trace_states();
     destroy_cdf();
 
     return 0;
