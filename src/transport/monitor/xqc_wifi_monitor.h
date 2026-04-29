@@ -1,44 +1,63 @@
 #ifndef _XQC_WIFI_MONITOR_H_INCLUDED_
 #define _XQC_WIFI_MONITOR_H_INCLUDED_
 
-#define xqc_demo_wifi_path_state_e            xqc_wifi_path_state_e
-#define XQC_DEMO_WIFI_PATH_STATE_UNKNOWN      XQC_WIFI_PATH_STATE_UNKNOWN
-#define XQC_DEMO_WIFI_PATH_STATE_REGULAR      XQC_WIFI_PATH_STATE_REGULAR
-#define XQC_DEMO_WIFI_PATH_STATE_DEGRADED_CSMA XQC_WIFI_PATH_STATE_DEGRADED_CSMA
-#define xqc_demo_wifi_path_state_t            xqc_wifi_path_state_t
-#define xqc_demo_wifi_state_snapshot_s        xqc_wifi_state_snapshot_s
-#define xqc_demo_wifi_state_snapshot_t        xqc_wifi_state_snapshot_t
-#define xqc_demo_wifi_state_update_pt         xqc_wifi_state_update_pt
-#define xqc_demo_wifi_monitor_config_s        xqc_wifi_monitor_config_s
-#define xqc_demo_wifi_monitor_config_t        xqc_wifi_monitor_config_t
-#define xqc_demo_wifi_monitor_s               xqc_wifi_monitor_s
-#define xqc_demo_wifi_monitor_t               xqc_wifi_monitor_t
-#define xqc_demo_wifi_monitor_start           xqc_wifi_monitor_start
-#define xqc_demo_wifi_monitor_stop            xqc_wifi_monitor_stop
-#define xqc_demo_wifi_monitor_get_snapshot    xqc_wifi_monitor_get_snapshot
-#define xqc_demo_wifi_monitor_is_running      xqc_wifi_monitor_is_running
-#define xqc_demo_wifi_monitor_start_status    xqc_wifi_monitor_start_status
-#define xqc_demo_wifi_monitor_last_error      xqc_wifi_monitor_last_error
+#include <stdint.h>
 
-#include "../../../demo/xqc_demo_wifi_monitor.h"
+typedef enum xqc_wifi_path_state_e {
+    XQC_WIFI_PATH_STATE_UNKNOWN = 0,
+    XQC_WIFI_PATH_STATE_REGULAR = 1,
+    XQC_WIFI_PATH_STATE_DEGRADED_CSMA = 2,
+} xqc_wifi_path_state_t;
 
-#undef xqc_demo_wifi_path_state_e
-#undef XQC_DEMO_WIFI_PATH_STATE_UNKNOWN
-#undef XQC_DEMO_WIFI_PATH_STATE_REGULAR
-#undef XQC_DEMO_WIFI_PATH_STATE_DEGRADED_CSMA
-#undef xqc_demo_wifi_path_state_t
-#undef xqc_demo_wifi_state_snapshot_s
-#undef xqc_demo_wifi_state_snapshot_t
-#undef xqc_demo_wifi_state_update_pt
-#undef xqc_demo_wifi_monitor_config_s
-#undef xqc_demo_wifi_monitor_config_t
-#undef xqc_demo_wifi_monitor_s
-#undef xqc_demo_wifi_monitor_t
-#undef xqc_demo_wifi_monitor_start
-#undef xqc_demo_wifi_monitor_stop
-#undef xqc_demo_wifi_monitor_get_snapshot
-#undef xqc_demo_wifi_monitor_is_running
-#undef xqc_demo_wifi_monitor_start_status
-#undef xqc_demo_wifi_monitor_last_error
+typedef struct xqc_wifi_state_snapshot_s {
+    uint64_t                ts_us;
+    char                    ifname[64];
+    unsigned int            ifindex;
+    xqc_wifi_path_state_t   state;
+    double                  pi_degraded;
+    double                  p_long_gap;
+    double                  r_eff_Bpus;
+    uint64_t                last_gap_us;
+    double                  ewma_gap_us;
+    double                  ewma_airtime_us;
+    double                  ewma_burst_bytes;
+    uint64_t                sample_count;
+    uint64_t                last_update_ts_us;
+} xqc_wifi_state_snapshot_t;
+
+typedef void (*xqc_wifi_state_update_pt)(
+    const xqc_wifi_state_snapshot_t *snapshot,
+    void *user_data);
+
+typedef struct xqc_wifi_monitor_config_s {
+    const char                  *output_dir;
+    const char                  *config_path;
+    const char                  *ifname_primary;
+    const char                  *ifname_secondary;
+    xqc_wifi_state_update_pt    state_update_cb;
+    void                        *state_update_user_data;
+} xqc_wifi_monitor_config_t;
+
+typedef struct xqc_wifi_monitor_s xqc_wifi_monitor_t;
+
+int
+xqc_wifi_monitor_start(xqc_wifi_monitor_t **monitor_out,
+    const xqc_wifi_monitor_config_t *config);
+
+void
+xqc_wifi_monitor_stop(xqc_wifi_monitor_t *monitor);
+
+int
+xqc_wifi_monitor_get_snapshot(xqc_wifi_monitor_t *monitor,
+    const char *ifname, xqc_wifi_state_snapshot_t *snapshot);
+
+int
+xqc_wifi_monitor_is_running(xqc_wifi_monitor_t *monitor);
+
+int
+xqc_wifi_monitor_start_status(xqc_wifi_monitor_t *monitor);
+
+const char *
+xqc_wifi_monitor_last_error(xqc_wifi_monitor_t *monitor);
 
 #endif

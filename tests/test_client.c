@@ -1222,6 +1222,29 @@ xqc_test_cli_apply_scheduler_name(const char *name, xqc_conn_settings_t *conn_se
         return 0;
     }
 
+    if (strcasecmp(name, "rr") == 0
+        || strcasecmp(name, "roundrobin") == 0
+        || strcasecmp(name, "round-robin") == 0)
+    {
+        conn_settings->scheduler_callback = xqc_rr_scheduler_cb;
+        return 0;
+    }
+
+    if (strcasecmp(name, "red") == 0
+        || strcasecmp(name, "redundant") == 0)
+    {
+        conn_settings->scheduler_callback = xqc_redundant_scheduler_cb;
+        conn_settings->reinj_ctl_callback = xqc_redundant_reinj_ctl_cb;
+        conn_settings->mp_enable_reinjection |= XQC_REINJ_UNACK_AFTER_SEND
+                                                | XQC_REINJ_UNACK_MULTI_PATH;
+        return 0;
+    }
+
+    if (strcasecmp(name, "blest") == 0) {
+        conn_settings->scheduler_callback = xqc_blest_scheduler_cb;
+        return 0;
+    }
+
 #ifdef XQC_ENABLE_MP_INTEROP
     if (strcasecmp(name, "interop") == 0) {
         conn_settings->scheduler_callback = xqc_interop_scheduler_cb;
@@ -5204,7 +5227,7 @@ void usage(int argc, char *argv[]) {
 "   -y    multipath backup path standby.\n"
 "   -z    periodically send request.\n"
 "   -S    request per second.\n"
-"   --scheduler             Multipath scheduler: minrtt|backup|rap|interop|backup_fec.\n"
+"   --scheduler             Multipath scheduler: minrtt|backup|rap|rr|roundrobin|red|redundant|blest|interop|backup_fec.\n"
 "   --wifi-monitor          Enable transport Wi-Fi monitor and CSV traces.\n"
 "   --wifi-monitor-out      Output directory for eBPF Wi-Fi artifacts.\n"
 "   --wifi-monitor-config   Config path for the Wi-Fi monitor runtime.\n"

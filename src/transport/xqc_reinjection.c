@@ -118,16 +118,26 @@ xqc_conn_reinject_unack_packets(xqc_connection_t *conn, xqc_reinjection_mode_t m
 {
     xqc_list_head_t *pos, *next;
     xqc_packet_out_t *packet_out;
+    xqc_bool_t multi_path_reinj;
+    uint32_t reinj_budget;
+
+    multi_path_reinj =
+        (conn->conn_settings.mp_enable_reinjection & XQC_REINJ_UNACK_MULTI_PATH)
+        ? XQC_TRUE : XQC_FALSE;
 
     xqc_list_for_each_safe(pos, next, &conn->conn_send_queue->sndq_unacked_packets[XQC_PNS_APP_DATA]) {
         packet_out = xqc_list_entry(pos, xqc_packet_out_t, po_list);
-        if (conn->reinj_callback
+
+        reinj_budget = multi_path_reinj ? XQC_MAX_PATHS_COUNT : 1;
+        while (reinj_budget > 0
+            && conn->reinj_callback
             && conn->reinj_callback->xqc_reinj_ctl_can_reinject
             && conn->reinj_callback->xqc_reinj_ctl_can_reinject(conn->reinj_ctl, packet_out, mode))
         {
+            reinj_budget--;
                     
             if (xqc_conn_try_reinject_packet(conn, packet_out) != XQC_OK) {
-                continue;
+                break;
             }
 
             xqc_log(conn->log, XQC_LOG_DEBUG, "|MP|REINJ|reinject unacked packets|"

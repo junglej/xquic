@@ -1067,6 +1067,9 @@ XQC_EXPORT_PUBLIC_API XQC_EXTERN const xqc_scheduler_callback_t xqc_minrtt_sched
 XQC_EXPORT_PUBLIC_API XQC_EXTERN const xqc_scheduler_callback_t xqc_backup_scheduler_cb;
 XQC_EXPORT_PUBLIC_API XQC_EXTERN const xqc_scheduler_callback_t xqc_backup_fec_scheduler_cb;
 XQC_EXPORT_PUBLIC_API XQC_EXTERN const xqc_scheduler_callback_t xqc_rap_scheduler_cb;
+XQC_EXPORT_PUBLIC_API XQC_EXTERN const xqc_scheduler_callback_t xqc_rr_scheduler_cb;
+XQC_EXPORT_PUBLIC_API XQC_EXTERN const xqc_scheduler_callback_t xqc_redundant_scheduler_cb;
+XQC_EXPORT_PUBLIC_API XQC_EXTERN const xqc_scheduler_callback_t xqc_blest_scheduler_cb;
 #ifdef XQC_ENABLE_MP_INTEROP
 XQC_EXPORT_PUBLIC_API XQC_EXTERN const xqc_scheduler_callback_t xqc_interop_scheduler_cb;
 #endif
@@ -1075,6 +1078,7 @@ typedef enum {
     XQC_REINJ_UNACK_AFTER_SCHED   = 1 << 0,
     XQC_REINJ_UNACK_BEFORE_SCHED  = 1 << 1,
     XQC_REINJ_UNACK_AFTER_SEND    = 1 << 2,
+    XQC_REINJ_UNACK_MULTI_PATH    = 1 << 3,
 } xqc_reinjection_mode_t;
 
 typedef struct xqc_reinj_ctl_callback_s {
@@ -1094,6 +1098,7 @@ typedef struct xqc_reinj_ctl_callback_s {
 XQC_EXPORT_PUBLIC_API XQC_EXTERN const xqc_reinj_ctl_callback_t xqc_default_reinj_ctl_cb;
 XQC_EXPORT_PUBLIC_API XQC_EXTERN const xqc_reinj_ctl_callback_t xqc_deadline_reinj_ctl_cb;
 XQC_EXPORT_PUBLIC_API XQC_EXTERN const xqc_reinj_ctl_callback_t xqc_dgram_reinj_ctl_cb;
+XQC_EXPORT_PUBLIC_API XQC_EXTERN const xqc_reinj_ctl_callback_t xqc_redundant_reinj_ctl_cb;
 
 typedef struct xqc_fec_code_callback_s {
     void (*xqc_fec_init)(xqc_connection_t *conn);
@@ -1378,6 +1383,9 @@ typedef struct xqc_conn_settings_s {
      *    reinject unacked packets before scheduling packets to paths.
      * bit2 = 1
      *    reinject unacked packets after sending packets.
+     * bit3 = 1
+     *    allow reinjection controller to create multiple replicas for one
+     *    packet in one pass.
      */
     int                         mp_enable_reinjection;
     /**
@@ -2280,4 +2288,3 @@ xqc_conn_settings_t xqc_conn_get_conn_settings_template(xqc_conn_settings_type_t
 #endif
 
 #endif /* _XQUIC_H_INCLUDED_ */
-

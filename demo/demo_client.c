@@ -2520,7 +2520,7 @@ xqc_demo_cli_init_conneciton_settings(xqc_conn_settings_t* settings,
     if (strncmp(args->quic_cfg.mp_sched, "minrtt", strlen("minrtt")) == 0) {
         sched = xqc_minrtt_scheduler_cb;
 
-    } if (strncmp(args->quic_cfg.mp_sched, "backup", strlen("backup")) == 0) {
+    } else if (strncmp(args->quic_cfg.mp_sched, "backup", strlen("backup")) == 0) {
         sched = xqc_backup_scheduler_cb;
 
     } else {

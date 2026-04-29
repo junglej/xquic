@@ -203,11 +203,16 @@ set(
     "src/transport/reinjection_control/xqc_reinj_default.c"
     "src/transport/reinjection_control/xqc_reinj_deadline.c"
     "src/transport/reinjection_control/xqc_reinj_dgram.c"
+    "src/transport/reinjection_control/xqc_reinj_redundant.c"
     "src/transport/scheduler/xqc_scheduler_minrtt.c"
+    "src/transport/scheduler/xqc_scheduler_observer.c"
     "src/transport/scheduler/xqc_scheduler_common.c"
     "src/transport/scheduler/xqc_scheduler_backup.c"
     "src/transport/scheduler/xqc_scheduler_backup_fec.c"
     "src/transport/scheduler/xqc_scheduler_rap.c"
+    "src/transport/scheduler/xqc_scheduler_rr.c"
+    "src/transport/scheduler/xqc_scheduler_redundant.c"
+    "src/transport/scheduler/xqc_scheduler_blest.c"
 )
 
 if(XQC_ENABLE_MP_INTEROP)
@@ -390,4 +395,3 @@ if (XQC_BUILD_SAMPLE)
     target_link_libraries(test_client xquic event)
     target_link_libraries(test_server xquic event)
 endif()
-

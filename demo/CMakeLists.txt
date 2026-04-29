@@ -10,7 +10,6 @@ set(
     DEMO_CLIENT_SOURCES
     ${HQ_SOURCES}
     "demo_client.c"
-    "xqc_demo_wifi_monitor.c"
     "${CMAKE_SOURCE_DIR}/../Lib/wpa_ctrl/wpa_ctrl.c"
 )
 

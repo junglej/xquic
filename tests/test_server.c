@@ -7,6 +7,7 @@
 #include <errno.h>
 #include <memory.h>
 #include <string.h>
+#include <strings.h>
 #include <stdlib.h>
 #include <event2/event.h>
 #include <inttypes.h>
@@ -162,6 +163,7 @@ double g_copa_ai = 1.0;
 double g_copa_delta = 0.05;
 int g_enable_h3_ext = 1;
 int g_mp_backup_mode = 0;
+char g_scheduler_name[64];
 char g_write_file[256];
 char g_read_file[256];
 char g_log_path[256];
@@ -184,6 +186,72 @@ static char g_stream_trace_path[512];
 static int g_stream_trace_disabled = 0;
 static uint64_t g_stream_trace_sample_us = 100000;
 static int g_stream_trace_full = 0;
+
+static int
+xqc_test_svr_apply_scheduler_name(const char *name, xqc_conn_settings_t *conn_settings)
+{
+    if (conn_settings == NULL || name == NULL || name[0] == '\0') {
+        return 0;
+    }
+
+    if (strcasecmp(name, "minrtt") == 0) {
+        conn_settings->scheduler_callback = xqc_minrtt_scheduler_cb;
+        return 0;
+    }
+
+    if (strcasecmp(name, "backup") == 0) {
+        conn_settings->scheduler_callback = xqc_backup_scheduler_cb;
+        return 0;
+    }
+
+    if (strcasecmp(name, "rap") == 0) {
+        conn_settings->scheduler_callback = xqc_rap_scheduler_cb;
+        return 0;
+    }
+
+    if (strcasecmp(name, "rr") == 0
+        || strcasecmp(name, "roundrobin") == 0
+        || strcasecmp(name, "round-robin") == 0)
+    {
+        conn_settings->scheduler_callback = xqc_rr_scheduler_cb;
+        return 0;
+    }
+
+    if (strcasecmp(name, "red") == 0
+        || strcasecmp(name, "redundant") == 0)
+    {
+        conn_settings->scheduler_callback = xqc_redundant_scheduler_cb;
+        conn_settings->reinj_ctl_callback = xqc_redundant_reinj_ctl_cb;
+        conn_settings->mp_enable_reinjection |= XQC_REINJ_UNACK_AFTER_SEND
+                                                | XQC_REINJ_UNACK_MULTI_PATH;
+        return 0;
+    }
+
+    if (strcasecmp(name, "blest") == 0) {
+        conn_settings->scheduler_callback = xqc_blest_scheduler_cb;
+        return 0;
+    }
+
+#ifdef XQC_ENABLE_MP_INTEROP
+    if (strcasecmp(name, "interop") == 0) {
+        conn_settings->scheduler_callback = xqc_interop_scheduler_cb;
+        return 0;
+    }
+#else
+    if (strcasecmp(name, "interop") == 0) {
+        return -1;
+    }
+#endif
+
+    if (strcasecmp(name, "backup_fec") == 0
+        || strcasecmp(name, "backup-fec") == 0)
+    {
+        conn_settings->scheduler_callback = xqc_backup_fec_scheduler_cb;
+        return 0;
+    }
+
+    return -1;
+}
 
 #define XQC_SERVER_STREAM_TRACE_FLAG_FIN 0x1u
 
@@ -2775,6 +2843,7 @@ void usage(int argc, char *argv[]) {
 "   --request_trace_full          Log every request read_notify row.\n"
 "   --stream_trace_sample_ms <n>  Sample clean transport stream trace every n ms.\n"
 "   --stream_trace_full           Log every transport stream read_notify row.\n"
+"   --scheduler <name>            Multipath scheduler: minrtt|backup|rap|rr|roundrobin|red|redundant|blest|interop|backup_fec.\n"
 , prog);
 }
 
@@ -2828,6 +2897,7 @@ int main(int argc, char *argv[]) {
         {"request_trace_full", no_argument, &long_opt_index, 8},
         {"stream_trace_sample_ms", required_argument, &long_opt_index, 9},
         {"stream_trace_full", no_argument, &long_opt_index, 10},
+        {"scheduler", required_argument, &long_opt_index, 11},
         {0, 0, 0, 0}
     };
 
@@ -3040,6 +3110,11 @@ int main(int argc, char *argv[]) {
                 printf("option stream trace full logging\n");
                 break;
 
+            case 11:
+                snprintf(g_scheduler_name, sizeof(g_scheduler_name), "%s", optarg);
+                printf("option scheduler:%s\n", g_scheduler_name);
+                break;
+
             default:
                 break;
             }
@@ -3211,6 +3286,13 @@ int main(int argc, char *argv[]) {
 
     if (g_enable_fec) {
         conn_settings.scheduler_callback = xqc_backup_fec_scheduler_cb;
+    }
+
+    if (g_scheduler_name[0] != '\0') {
+        if (xqc_test_svr_apply_scheduler_name(g_scheduler_name, &conn_settings) != 0) {
+            printf("unknown scheduler: %s\n", g_scheduler_name);
+            return -1;
+        }
     }
 
     if (g_enable_fec) {

@@ -4,6 +4,7 @@ import sys
 import json
 import re
 import datetime
+import tempfile
 
 connectivity_event_list_ = ["server_listening",      "connection_started",  "connection_closed",
                             "connection_id_updated", "spin_bit_updated",   "connection_state_updated",
@@ -50,8 +51,6 @@ frame_type_   = ["PADDING", "PING", "ACK", "RESET_STREAM", "STOP_SENDING", "CRYP
 h3_stream_type_ = ["control", "push", "qpack_encode", "qpack_decode", "request", "bytestream", "unknown"]
 
 h3_frame_type_ = ["data", "headers", "bidi_stream_type", "cancel_push", "settings", "push_promise", "goaway", "max_push_id", "unknown"]
-
-last_scid_ = "initcid"
 
 def get_path_id(line):
     segments = line.split('|')
@@ -122,53 +121,96 @@ def parse_line(line):
 
 
 
-def endpoint_events_extraction(file_name, vantagepoint):
-    assert(vantagepoint == "server" or vantagepoint == "client")
-    conn_events = {
-        "vantage_point" :  {"name": vantagepoint + "-view",
-                             "type": vantagepoint
-        },
-        "title": "xquic qlog", 
+def _normalize_scid(scid):
+    if scid is None:
+        return "unknown"
+    scid = str(scid).strip()
+    return scid if scid else "unknown"
+
+
+def _new_trace_bucket(vantagepoint, scid, temp_dir, index):
+    return {
+        "title": "xquic-qlog json: " + vantagepoint,
         "description": "",
-        "common_fields": { "ODCID": "", "time_format": "absolute" },
-        "events": []
+        "common_fields": {"ODCID": scid, "time_format": "absolute"},
+        "vantage_point": {"name": vantagepoint + "-view", "type": vantagepoint},
+        "events_path": os.path.join(temp_dir, f"{vantagepoint}_{index:06d}.events.jsonl"),
+        "event_count": 0,
+        "handle": None,
     }
-    count = 0
-    last_scid_ = "initcid"
-    traces_log = {}
-    with open(file_name, 'r',encoding='utf-8', errors='ignore') as file:
+
+
+def stream_endpoint_events_to_temp(file_name, vantagepoint, temp_dir):
+    assert(vantagepoint == "server" or vantagepoint == "client")
+    trace_buckets = {}
+    trace_order = []
+
+    with open(file_name, 'r', encoding='utf-8', errors='ignore') as file:
         for line in file:
             event, scid = parse_line(line)
-            if (event is None):
+            if event is None:
                 continue
-            if (event is not None) and (scid != last_scid_):
-                if count > 0:
-                    if(scid in traces_log):
-                        traces_log[scid]['events'] += conn_events['events']
-                    else:
-                        traces_log[last_scid_] = conn_events
-                last_scid_ = scid
-                conn_events = {
-                    "title": "xquic-qlog json: " + vantagepoint, 
-                    "description": "",
-                    "common_fields": { "ODCID": scid, "time_format": "absolute" },
-                    "vantage_point" :  {"name": vantagepoint + "-view",
-                             "type": vantagepoint
-                    },
-                    "events": []
-                }
-                count = 1
-                conn_events["events"].append(event)
-            else:
-                count += 1
-                conn_events["events"].append(event)
-    if(count > 1):
-        scid = conn_events["common_fields"]["ODCID"]
-        if(scid in traces_log):
-            traces_log[scid]['events'] += conn_events['events']
-        else:
-            traces_log[scid] = conn_events
-    return list(traces_log.values())
+
+            scid = _normalize_scid(scid)
+            if scid not in trace_buckets:
+                bucket = _new_trace_bucket(vantagepoint, scid, temp_dir, len(trace_order))
+                bucket["handle"] = open(bucket["events_path"], 'w', encoding='utf-8')
+                trace_buckets[scid] = bucket
+                trace_order.append(bucket)
+
+            bucket = trace_buckets[scid]
+            json.dump(event, bucket["handle"], separators=(",", ":"))
+            bucket["handle"].write("\n")
+            bucket["event_count"] += 1
+
+    for bucket in trace_order:
+        if bucket["handle"] is not None:
+            bucket["handle"].close()
+            bucket["handle"] = None
+
+    return trace_order
+
+
+def write_qlog_json(qlog_path, trace_buckets):
+    with open(qlog_path, 'w', encoding='utf-8') as out_file:
+        out_file.write('{"qlog_version":"0.4","qlog_format":"JSON",')
+        out_file.write('"title":"xquic qlog",')
+        out_file.write('"description":"this is a demo qlog json of qlog-draft-07",')
+        out_file.write('"traces":[')
+
+        first_trace = True
+        for bucket in trace_buckets:
+            if bucket["event_count"] <= 0:
+                continue
+
+            if not first_trace:
+                out_file.write(',')
+            first_trace = False
+
+            trace_meta = {
+                "title": bucket["title"],
+                "description": bucket["description"],
+                "common_fields": bucket["common_fields"],
+                "vantage_point": bucket["vantage_point"],
+            }
+            trace_meta_json = json.dumps(trace_meta, separators=(",", ":"))
+            out_file.write(trace_meta_json[:-1])
+            out_file.write(',"events":[')
+
+            first_event = True
+            with open(bucket["events_path"], 'r', encoding='utf-8') as events_file:
+                for raw_event in events_file:
+                    raw_event = raw_event.strip()
+                    if not raw_event:
+                        continue
+                    if not first_event:
+                        out_file.write(',')
+                    first_event = False
+                    out_file.write(raw_event)
+
+            out_file.write(']}')
+
+        out_file.write(']}')
 
 
 def parse_packet_sent_and_recv(line):
@@ -941,7 +983,6 @@ def parse_http_frame_parsed(line):
     
 
 def main():
-    global last_scid_
     parser = argparse.ArgumentParser()
     parser.add_argument("--clog", help="xquic client log file")
     parser.add_argument("--slog", help="xquic server log file")
@@ -960,24 +1001,15 @@ def main():
         print(f"Error: The qlog_path should endswith .json.")
         sys.exit(1)
 
-    data = { "qlog_version": "0.4",
-        "qlog_format": "JSON",
-        "title": "xquic qlog",
-        "description": "this is a demo qlog json of qlog-draft-07",
-        "traces": [] 
-    }
-    if(args.slog is not None):
-        server_traces = endpoint_events_extraction(args.slog, "server")
-        data["traces"] += server_traces
+    all_traces = []
+    with tempfile.TemporaryDirectory(prefix="xquic_qlog_") as temp_dir:
+        if(args.slog is not None):
+            all_traces += stream_endpoint_events_to_temp(args.slog, "server", temp_dir)
 
-    if(args.clog is not None):
-        client_traces = endpoint_events_extraction(args.clog, "client")
-        data["traces"] += client_traces
+        if(args.clog is not None):
+            all_traces += stream_endpoint_events_to_temp(args.clog, "client", temp_dir)
 
-    json_output = json.dumps(data, indent=4)
-    
-    with open(args.qlog_path, 'w') as out_file:
-        out_file.write(json_output)
+        write_qlog_json(args.qlog_path, all_traces)
 
 
 if __name__ == "__main__":

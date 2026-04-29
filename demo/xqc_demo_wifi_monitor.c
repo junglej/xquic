@@ -1,3 +1,11 @@
+/*
+ * Compatibility source only.
+ *
+ * The active Wi-Fi monitor implementation now lives in
+ * src/transport/monitor/xqc_wifi_monitor.c.
+ */
+#if 0
+
 #define _GNU_SOURCE
 
 #include "xqc_demo_wifi_monitor.h"
@@ -798,3 +806,5 @@ xqc_demo_wifi_monitor_last_error(xqc_demo_wifi_monitor_t *monitor)
 {
     return monitor ? monitor->last_error : "monitor-not-created";
 }
+
+#endif
