@@ -783,7 +783,7 @@ xqc_demo_cli_open_aux_trace_files(xqc_demo_cli_ctx_t *ctx)
     }
 
     ctx->wifi_state_fd = xqc_demo_cli_open_aux_csv(ctx->wifi_state_path,
-        "ts_us,conn,path_id,path_seq,ifname,ifindex,wifi_state,pi_degraded,p_long_gap,r_eff_Bpus,last_gap_us,ewma_gap_us,ewma_airtime_us,ewma_burst_bytes,sample_count,last_update_ts_us");
+        "ts_us,conn,path_id,path_seq,ifname,ifindex,wifi_state,pi_degraded,p_long_gap,r_eff_Bpus,last_gap_us,ewma_gap_us,ewma_airtime_us,ewma_burst_bytes,sample_count,last_update_ts_us,gtsd_calibrated,tail_p50_us,tail_p95_us,tail_ratio,tail_baseline,tail_excess,cusum_on,cusum_off");
     if (ctx->wifi_state_fd < 0) {
         printf("open wifi state trace failed: %s, errno: %d\n",
             ctx->wifi_state_path, get_sys_errno());
@@ -792,7 +792,7 @@ xqc_demo_cli_open_aux_trace_files(xqc_demo_cli_ctx_t *ctx)
     }
 
     ctx->scheduler_trace_fd = xqc_demo_cli_open_aux_csv(ctx->scheduler_trace_path,
-        "ts_us,conn,scheduler,selected_path_id,selected_ifname,selected_ifindex,selected_on_degraded,other_cleaner,path0_id,path0_ifname,path0_ifindex,path0_srtt_us,path0_cwnd_bytes,path0_bytes_in_flight,path0_can_send,path0_path_state,path0_app_status,path0_wifi_state,path0_pi,path0_p_long_gap,path0_last_gap_us,path0_r_eff_Bpus,path1_id,path1_ifname,path1_ifindex,path1_srtt_us,path1_cwnd_bytes,path1_bytes_in_flight,path1_can_send,path1_path_state,path1_app_status,path1_wifi_state,path1_pi,path1_p_long_gap,path1_last_gap_us,path1_r_eff_Bpus");
+        "ts_us,conn,scheduler,selected_path_id,selected_ifname,selected_ifindex,selected_on_degraded,other_cleaner,path0_id,path0_ifname,path0_ifindex,path0_srtt_us,path0_cwnd_bytes,path0_bytes_in_flight,path0_can_send,path0_path_state,path0_app_status,path0_wifi_state,path0_pi,path0_p_long_gap,path0_last_gap_us,path0_r_eff_Bpus,path0_gtsd_calibrated,path0_tail_p50_us,path0_tail_p95_us,path0_tail_ratio,path0_tail_baseline,path0_tail_excess,path0_cusum_on,path0_cusum_off,path1_id,path1_ifname,path1_ifindex,path1_srtt_us,path1_cwnd_bytes,path1_bytes_in_flight,path1_can_send,path1_path_state,path1_app_status,path1_wifi_state,path1_pi,path1_p_long_gap,path1_last_gap_us,path1_r_eff_Bpus,path1_gtsd_calibrated,path1_tail_p50_us,path1_tail_p95_us,path1_tail_ratio,path1_tail_baseline,path1_tail_excess,path1_cusum_on,path1_cusum_off");
     if (ctx->scheduler_trace_fd < 0) {
         printf("open scheduler trace failed: %s, errno: %d\n",
             ctx->scheduler_trace_path, get_sys_errno());
@@ -967,14 +967,14 @@ xqc_demo_cli_log_wifi_state_snapshot(xqc_demo_cli_ctx_t *ctx,
     xqc_demo_cli_user_conn_t *user_conn, xqc_demo_cli_user_path_t *user_path,
     const xqc_demo_wifi_state_snapshot_t *snapshot)
 {
-    char line[768];
+    char line[1024];
 
     if (ctx == NULL || snapshot == NULL || ctx->wifi_state_fd <= 0) {
         return;
     }
 
     snprintf(line, sizeof(line),
-        "%"PRIu64",%p,%"PRIu64",%d,%s,%u,%s,%.6f,%.6f,%.6f,%"PRIu64",%.3f,%.3f,%.3f,%"PRIu64",%"PRIu64"",
+        "%"PRIu64",%p,%"PRIu64",%d,%s,%u,%s,%.6f,%.6f,%.6f,%"PRIu64",%.3f,%.3f,%.3f,%"PRIu64",%"PRIu64",%u,%"PRIu64",%"PRIu64",%.6f,%.6f,%.6f,%.6f,%.6f",
         snapshot->ts_us,
         user_conn,
         user_path ? user_path->path_id : 0,
@@ -990,7 +990,15 @@ xqc_demo_cli_log_wifi_state_snapshot(xqc_demo_cli_ctx_t *ctx,
         snapshot->ewma_airtime_us,
         snapshot->ewma_burst_bytes,
         snapshot->sample_count,
-        snapshot->last_update_ts_us);
+        snapshot->last_update_ts_us,
+        (unsigned) snapshot->gtsd_calibrated,
+        snapshot->tail_p50_us,
+        snapshot->tail_p95_us,
+        snapshot->tail_ratio,
+        snapshot->tail_baseline,
+        snapshot->tail_excess,
+        snapshot->cusum_on,
+        snapshot->cusum_off);
     xqc_demo_cli_write_aux_line(ctx->wifi_state_fd, line);
 }
 
@@ -1037,7 +1045,7 @@ xqc_demo_cli_scheduler_observer_cb(const xqc_scheduler_observation_t *observatio
     int selected_on_degraded = 0;
     int other_cleaner = 0;
     int i;
-    char line[2048];
+    char line[4096];
     const char *selected_ifname = "-";
     unsigned int selected_ifindex = 0;
 
@@ -1122,8 +1130,8 @@ xqc_demo_cli_scheduler_observer_cb(const xqc_scheduler_observation_t *observatio
 
     snprintf(line, sizeof(line),
         "%"PRIu64",%p,%s,%"PRIu64",%s,%u,%d,%d,"
-        "%"PRIu64",%s,%u,%"PRIu64",%"PRIu64",%"PRIu64",%u,%u,%u,%s,%.6f,%.6f,%"PRIu64",%.6f,"
-        "%"PRIu64",%s,%u,%"PRIu64",%"PRIu64",%"PRIu64",%u,%u,%u,%s,%.6f,%.6f,%"PRIu64",%.6f",
+        "%"PRIu64",%s,%u,%"PRIu64",%"PRIu64",%"PRIu64",%u,%u,%u,%s,%.6f,%.6f,%"PRIu64",%.6f,%u,%"PRIu64",%"PRIu64",%.6f,%.6f,%.6f,%.6f,%.6f,"
+        "%"PRIu64",%s,%u,%"PRIu64",%"PRIu64",%"PRIu64",%u,%u,%u,%s,%.6f,%.6f,%"PRIu64",%.6f,%u,%"PRIu64",%"PRIu64",%.6f,%.6f,%.6f,%.6f,%.6f",
         observation->ts_us,
         user_conn,
         observation->scheduler_name ? observation->scheduler_name : "-",
@@ -1146,6 +1154,14 @@ xqc_demo_cli_scheduler_observer_cb(const xqc_scheduler_observation_t *observatio
         rows[0].has_wifi_snapshot ? rows[0].wifi_snapshot.p_long_gap : 0.0,
         rows[0].has_wifi_snapshot ? rows[0].wifi_snapshot.last_gap_us : 0,
         rows[0].has_wifi_snapshot ? rows[0].wifi_snapshot.r_eff_Bpus : 0.0,
+        rows[0].has_wifi_snapshot ? (unsigned) rows[0].wifi_snapshot.gtsd_calibrated : 0,
+        rows[0].has_wifi_snapshot ? rows[0].wifi_snapshot.tail_p50_us : 0,
+        rows[0].has_wifi_snapshot ? rows[0].wifi_snapshot.tail_p95_us : 0,
+        rows[0].has_wifi_snapshot ? rows[0].wifi_snapshot.tail_ratio : 0.0,
+        rows[0].has_wifi_snapshot ? rows[0].wifi_snapshot.tail_baseline : 0.0,
+        rows[0].has_wifi_snapshot ? rows[0].wifi_snapshot.tail_excess : 0.0,
+        rows[0].has_wifi_snapshot ? rows[0].wifi_snapshot.cusum_on : 0.0,
+        rows[0].has_wifi_snapshot ? rows[0].wifi_snapshot.cusum_off : 0.0,
         rows[1].path_id,
         rows[1].ifname ? rows[1].ifname : "-",
         rows[1].ifindex,
@@ -1159,7 +1175,15 @@ xqc_demo_cli_scheduler_observer_cb(const xqc_scheduler_observation_t *observatio
         rows[1].has_wifi_snapshot ? rows[1].wifi_snapshot.pi_degraded : 0.0,
         rows[1].has_wifi_snapshot ? rows[1].wifi_snapshot.p_long_gap : 0.0,
         rows[1].has_wifi_snapshot ? rows[1].wifi_snapshot.last_gap_us : 0,
-        rows[1].has_wifi_snapshot ? rows[1].wifi_snapshot.r_eff_Bpus : 0.0);
+        rows[1].has_wifi_snapshot ? rows[1].wifi_snapshot.r_eff_Bpus : 0.0,
+        rows[1].has_wifi_snapshot ? (unsigned) rows[1].wifi_snapshot.gtsd_calibrated : 0,
+        rows[1].has_wifi_snapshot ? rows[1].wifi_snapshot.tail_p50_us : 0,
+        rows[1].has_wifi_snapshot ? rows[1].wifi_snapshot.tail_p95_us : 0,
+        rows[1].has_wifi_snapshot ? rows[1].wifi_snapshot.tail_ratio : 0.0,
+        rows[1].has_wifi_snapshot ? rows[1].wifi_snapshot.tail_baseline : 0.0,
+        rows[1].has_wifi_snapshot ? rows[1].wifi_snapshot.tail_excess : 0.0,
+        rows[1].has_wifi_snapshot ? rows[1].wifi_snapshot.cusum_on : 0.0,
+        rows[1].has_wifi_snapshot ? rows[1].wifi_snapshot.cusum_off : 0.0);
     xqc_demo_cli_write_aux_line(ctx->scheduler_trace_fd, line);
 }
 

@@ -23,6 +23,14 @@ typedef struct xqc_wifi_state_snapshot_s {
     double                  ewma_burst_bytes;
     uint64_t                sample_count;
     uint64_t                last_update_ts_us;
+    uint8_t                 gtsd_calibrated;
+    uint64_t                tail_p50_us;
+    uint64_t                tail_p95_us;
+    double                  tail_ratio;
+    double                  tail_baseline;
+    double                  tail_excess;
+    double                  cusum_on;
+    double                  cusum_off;
 } xqc_wifi_state_snapshot_t;
 
 typedef void (*xqc_wifi_state_update_pt)(

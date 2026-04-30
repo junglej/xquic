@@ -621,9 +621,9 @@ xqc_test_cli_open_aux_trace_files(client_ctx_t *c)
     c->send_trace_fd = xqc_test_cli_open_aux_csv(c->send_trace_path,
         "ts_us,conn,path_id,path_seq,ifname,ifindex,fd,len,quic_form,quic_type,quic_dcid,quic_pn_raw,quic_pn_len");
     c->wifi_state_fd = xqc_test_cli_open_aux_csv(c->wifi_state_path,
-        "ts_us,conn,path_id,path_seq,ifname,ifindex,wifi_state,pi_degraded,p_long_gap,r_eff_Bpus,last_gap_us,ewma_gap_us,ewma_airtime_us,ewma_burst_bytes,sample_count,last_update_ts_us");
+        "ts_us,conn,path_id,path_seq,ifname,ifindex,wifi_state,pi_degraded,p_long_gap,r_eff_Bpus,last_gap_us,ewma_gap_us,ewma_airtime_us,ewma_burst_bytes,sample_count,last_update_ts_us,gtsd_calibrated,tail_p50_us,tail_p95_us,tail_ratio,tail_baseline,tail_excess,cusum_on,cusum_off");
     c->scheduler_trace_fd = xqc_test_cli_open_aux_csv(c->scheduler_trace_path,
-        "ts_us,conn,scheduler,selected_path_id,selected_ifname,selected_ifindex,selected_on_degraded,other_cleaner,path0_id,path0_ifname,path0_ifindex,path0_srtt_us,path0_cwnd_bytes,path0_bytes_in_flight,path0_can_send,path0_path_state,path0_app_status,path0_wifi_state,path0_pi,path0_p_long_gap,path0_last_gap_us,path0_r_eff_Bpus,path1_id,path1_ifname,path1_ifindex,path1_srtt_us,path1_cwnd_bytes,path1_bytes_in_flight,path1_can_send,path1_path_state,path1_app_status,path1_wifi_state,path1_pi,path1_p_long_gap,path1_last_gap_us,path1_r_eff_Bpus");
+        "ts_us,conn,scheduler,selected_path_id,selected_ifname,selected_ifindex,selected_on_degraded,other_cleaner,path0_id,path0_ifname,path0_ifindex,path0_srtt_us,path0_cwnd_bytes,path0_bytes_in_flight,path0_can_send,path0_path_state,path0_app_status,path0_wifi_state,path0_pi,path0_p_long_gap,path0_last_gap_us,path0_r_eff_Bpus,path0_gtsd_calibrated,path0_tail_p50_us,path0_tail_p95_us,path0_tail_ratio,path0_tail_baseline,path0_tail_excess,path0_cusum_on,path0_cusum_off,path1_id,path1_ifname,path1_ifindex,path1_srtt_us,path1_cwnd_bytes,path1_bytes_in_flight,path1_can_send,path1_path_state,path1_app_status,path1_wifi_state,path1_pi,path1_p_long_gap,path1_last_gap_us,path1_r_eff_Bpus,path1_gtsd_calibrated,path1_tail_p50_us,path1_tail_p95_us,path1_tail_ratio,path1_tail_baseline,path1_tail_excess,path1_cusum_on,path1_cusum_off");
     if (g_transport == 1) {
         xqc_test_cli_build_aux_path(g_log_path, XQC_TEST_CLI_STREAM_TRACE_SUFFIX,
             c->stream_trace_path, sizeof(c->stream_trace_path));
@@ -923,14 +923,14 @@ static void
 xqc_test_cli_log_wifi_state_snapshot(client_ctx_t *c, xqc_user_path_t *path,
     const xqc_wifi_state_snapshot_t *snapshot)
 {
-    char line[768];
+    char line[1024];
 
     if (c == NULL || snapshot == NULL || c->wifi_state_fd <= 0) {
         return;
     }
 
     snprintf(line, sizeof(line),
-        "%"PRIu64",%p,%"PRIu64",%d,%s,%u,%s,%.6f,%.6f,%.6f,%"PRIu64",%.3f,%.3f,%.3f,%"PRIu64",%"PRIu64"",
+        "%"PRIu64",%p,%"PRIu64",%d,%s,%u,%s,%.6f,%.6f,%.6f,%"PRIu64",%.3f,%.3f,%.3f,%"PRIu64",%"PRIu64",%u,%"PRIu64",%"PRIu64",%.6f,%.6f,%.6f,%.6f,%.6f",
         snapshot->ts_us,
         path ? path->user_conn : NULL,
         path ? path->path_id : 0,
@@ -946,7 +946,15 @@ xqc_test_cli_log_wifi_state_snapshot(client_ctx_t *c, xqc_user_path_t *path,
         snapshot->ewma_airtime_us,
         snapshot->ewma_burst_bytes,
         snapshot->sample_count,
-        snapshot->last_update_ts_us);
+        snapshot->last_update_ts_us,
+        (unsigned) snapshot->gtsd_calibrated,
+        snapshot->tail_p50_us,
+        snapshot->tail_p95_us,
+        snapshot->tail_ratio,
+        snapshot->tail_baseline,
+        snapshot->tail_excess,
+        snapshot->cusum_on,
+        snapshot->cusum_off);
     xqc_test_cli_write_aux_line(c->wifi_state_fd, line);
 }
 
@@ -990,7 +998,7 @@ xqc_test_cli_scheduler_observer_cb(const xqc_scheduler_observation_t *observatio
     int selected_on_degraded = 0;
     int other_cleaner = 0;
     int i;
-    char line[2048];
+    char line[4096];
     const char *selected_ifname = "-";
     unsigned int selected_ifindex = 0;
 
@@ -1065,8 +1073,8 @@ xqc_test_cli_scheduler_observer_cb(const xqc_scheduler_observation_t *observatio
 
     snprintf(line, sizeof(line),
         "%"PRIu64",%p,%s,%"PRIu64",%s,%u,%d,%d,"
-        "%"PRIu64",%s,%u,%"PRIu64",%"PRIu64",%"PRIu64",%u,%u,%u,%s,%.6f,%.6f,%"PRIu64",%.6f,"
-        "%"PRIu64",%s,%u,%"PRIu64",%"PRIu64",%"PRIu64",%u,%u,%u,%s,%.6f,%.6f,%"PRIu64",%.6f",
+        "%"PRIu64",%s,%u,%"PRIu64",%"PRIu64",%"PRIu64",%u,%u,%u,%s,%.6f,%.6f,%"PRIu64",%.6f,%u,%"PRIu64",%"PRIu64",%.6f,%.6f,%.6f,%.6f,%.6f,"
+        "%"PRIu64",%s,%u,%"PRIu64",%"PRIu64",%"PRIu64",%u,%u,%u,%s,%.6f,%.6f,%"PRIu64",%.6f,%u,%"PRIu64",%"PRIu64",%.6f,%.6f,%.6f,%.6f,%.6f",
         observation->ts_us,
         observation->conn_user_data,
         observation->scheduler_name ? observation->scheduler_name : "-",
@@ -1089,6 +1097,14 @@ xqc_test_cli_scheduler_observer_cb(const xqc_scheduler_observation_t *observatio
         rows[0].has_wifi_snapshot ? rows[0].wifi_snapshot.p_long_gap : 0.0,
         rows[0].has_wifi_snapshot ? rows[0].wifi_snapshot.last_gap_us : 0,
         rows[0].has_wifi_snapshot ? rows[0].wifi_snapshot.r_eff_Bpus : 0.0,
+        rows[0].has_wifi_snapshot ? (unsigned) rows[0].wifi_snapshot.gtsd_calibrated : 0,
+        rows[0].has_wifi_snapshot ? rows[0].wifi_snapshot.tail_p50_us : 0,
+        rows[0].has_wifi_snapshot ? rows[0].wifi_snapshot.tail_p95_us : 0,
+        rows[0].has_wifi_snapshot ? rows[0].wifi_snapshot.tail_ratio : 0.0,
+        rows[0].has_wifi_snapshot ? rows[0].wifi_snapshot.tail_baseline : 0.0,
+        rows[0].has_wifi_snapshot ? rows[0].wifi_snapshot.tail_excess : 0.0,
+        rows[0].has_wifi_snapshot ? rows[0].wifi_snapshot.cusum_on : 0.0,
+        rows[0].has_wifi_snapshot ? rows[0].wifi_snapshot.cusum_off : 0.0,
         rows[1].path_id,
         rows[1].ifname ? rows[1].ifname : "-",
         rows[1].ifindex,
@@ -1102,7 +1118,15 @@ xqc_test_cli_scheduler_observer_cb(const xqc_scheduler_observation_t *observatio
         rows[1].has_wifi_snapshot ? rows[1].wifi_snapshot.pi_degraded : 0.0,
         rows[1].has_wifi_snapshot ? rows[1].wifi_snapshot.p_long_gap : 0.0,
         rows[1].has_wifi_snapshot ? rows[1].wifi_snapshot.last_gap_us : 0,
-        rows[1].has_wifi_snapshot ? rows[1].wifi_snapshot.r_eff_Bpus : 0.0);
+        rows[1].has_wifi_snapshot ? rows[1].wifi_snapshot.r_eff_Bpus : 0.0,
+        rows[1].has_wifi_snapshot ? (unsigned) rows[1].wifi_snapshot.gtsd_calibrated : 0,
+        rows[1].has_wifi_snapshot ? rows[1].wifi_snapshot.tail_p50_us : 0,
+        rows[1].has_wifi_snapshot ? rows[1].wifi_snapshot.tail_p95_us : 0,
+        rows[1].has_wifi_snapshot ? rows[1].wifi_snapshot.tail_ratio : 0.0,
+        rows[1].has_wifi_snapshot ? rows[1].wifi_snapshot.tail_baseline : 0.0,
+        rows[1].has_wifi_snapshot ? rows[1].wifi_snapshot.tail_excess : 0.0,
+        rows[1].has_wifi_snapshot ? rows[1].wifi_snapshot.cusum_on : 0.0,
+        rows[1].has_wifi_snapshot ? rows[1].wifi_snapshot.cusum_off : 0.0);
     xqc_test_cli_write_aux_line(c->scheduler_trace_fd, line);
 }
 
@@ -1237,6 +1261,28 @@ xqc_test_cli_apply_scheduler_name(const char *name, xqc_conn_settings_t *conn_se
         conn_settings->reinj_ctl_callback = xqc_redundant_reinj_ctl_cb;
         conn_settings->mp_enable_reinjection |= XQC_REINJ_UNACK_AFTER_SEND
                                                 | XQC_REINJ_UNACK_MULTI_PATH;
+        return 0;
+    }
+
+    if (strcasecmp(name, "copy") == 0
+        || strcasecmp(name, "csma_copy") == 0
+        || strcasecmp(name, "csma-copy") == 0)
+    {
+        conn_settings->scheduler_callback = xqc_copy_scheduler_cb;
+        conn_settings->reinj_ctl_callback = xqc_redundant_reinj_ctl_cb;
+        conn_settings->mp_enable_reinjection |= XQC_REINJ_UNACK_AFTER_SEND
+                                                | XQC_REINJ_UNACK_MULTI_PATH;
+        return 0;
+    }
+
+    if (strcasecmp(name, "xlink") == 0
+        || strcasecmp(name, "xquic_scheduler_xlink") == 0)
+    {
+        conn_settings->scheduler_callback = xquic_scheduler_xlink;
+        conn_settings->reinj_ctl_callback = xqc_default_reinj_ctl_cb;
+        conn_settings->mp_enable_reinjection |= XQC_REINJ_UNACK_AFTER_SCHED
+                                                | XQC_REINJ_UNACK_MULTI_PATH;
+        conn_settings->mp_ack_on_any_path = 1;
         return 0;
     }
 
@@ -5227,7 +5273,7 @@ void usage(int argc, char *argv[]) {
 "   -y    multipath backup path standby.\n"
 "   -z    periodically send request.\n"
 "   -S    request per second.\n"
-"   --scheduler             Multipath scheduler: minrtt|backup|rap|rr|roundrobin|red|redundant|blest|interop|backup_fec.\n"
+"   --scheduler             Multipath scheduler: minrtt|backup|rap|rr|roundrobin|red|redundant|copy|csma_copy|xlink|blest|interop|backup_fec.\n"
 "   --wifi-monitor          Enable transport Wi-Fi monitor and CSV traces.\n"
 "   --wifi-monitor-out      Output directory for eBPF Wi-Fi artifacts.\n"
 "   --wifi-monitor-config   Config path for the Wi-Fi monitor runtime.\n"

@@ -227,6 +227,28 @@ xqc_test_svr_apply_scheduler_name(const char *name, xqc_conn_settings_t *conn_se
         return 0;
     }
 
+    if (strcasecmp(name, "copy") == 0
+        || strcasecmp(name, "csma_copy") == 0
+        || strcasecmp(name, "csma-copy") == 0)
+    {
+        conn_settings->scheduler_callback = xqc_copy_scheduler_cb;
+        conn_settings->reinj_ctl_callback = xqc_redundant_reinj_ctl_cb;
+        conn_settings->mp_enable_reinjection |= XQC_REINJ_UNACK_AFTER_SEND
+                                                | XQC_REINJ_UNACK_MULTI_PATH;
+        return 0;
+    }
+
+    if (strcasecmp(name, "xlink") == 0
+        || strcasecmp(name, "xquic_scheduler_xlink") == 0)
+    {
+        conn_settings->scheduler_callback = xquic_scheduler_xlink;
+        conn_settings->reinj_ctl_callback = xqc_default_reinj_ctl_cb;
+        conn_settings->mp_enable_reinjection |= XQC_REINJ_UNACK_AFTER_SCHED
+                                                | XQC_REINJ_UNACK_MULTI_PATH;
+        conn_settings->mp_ack_on_any_path = 1;
+        return 0;
+    }
+
     if (strcasecmp(name, "blest") == 0) {
         conn_settings->scheduler_callback = xqc_blest_scheduler_cb;
         return 0;
@@ -2843,7 +2865,7 @@ void usage(int argc, char *argv[]) {
 "   --request_trace_full          Log every request read_notify row.\n"
 "   --stream_trace_sample_ms <n>  Sample clean transport stream trace every n ms.\n"
 "   --stream_trace_full           Log every transport stream read_notify row.\n"
-"   --scheduler <name>            Multipath scheduler: minrtt|backup|rap|rr|roundrobin|red|redundant|blest|interop|backup_fec.\n"
+"   --scheduler <name>            Multipath scheduler: minrtt|backup|rap|rr|roundrobin|red|redundant|copy|csma_copy|xlink|blest|interop|backup_fec.\n"
 , prog);
 }
 

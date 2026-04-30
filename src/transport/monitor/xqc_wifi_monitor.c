@@ -30,6 +30,18 @@
 #define XQC_WIFI_MONITOR_LOG_INTERVAL_US 1000000ULL
 #define XQC_WIFI_MONITOR_KEEP_STATUS INT_MIN
 #define XQC_WIFI_MONITOR_START_WAIT_US 5000000ULL
+#define XQC_WIFI_GTSD_WINDOW_SIZE 128
+#define XQC_WIFI_GTSD_UPDATE_STRIDE 32
+#define XQC_WIFI_GTSD_R0_MIN 1.2
+#define XQC_WIFI_GTSD_R0_MAX 2.5
+#define XQC_WIFI_GTSD_ON_DELTA 0.5
+#define XQC_WIFI_GTSD_ON_THRESHOLD 3.0
+#define XQC_WIFI_GTSD_ON_EXCESS_CAP 2.0
+#define XQC_WIFI_GTSD_CLEAR_THRESHOLD 0.5
+#define XQC_WIFI_GTSD_OFF_THRESHOLD 3.0
+#define XQC_WIFI_GTSD_OFF_EVIDENCE_CAP 0.5
+#define XQC_WIFI_GTSD_P95_REL_GUARD 2.0
+#define XQC_WIFI_GTSD_P95_ABS_GUARD_US 5000ULL
 
 typedef struct xqc_wifi_iface_state_s {
     char                        ifname[64];
@@ -37,6 +49,11 @@ typedef struct xqc_wifi_iface_state_s {
     xqc_wifi_state_snapshot_t   snapshot;
     double                      ewma_long_gap;
     uint64_t                    last_logged_ts_us;
+    uint32_t                    gap_window[XQC_WIFI_GTSD_WINDOW_SIZE];
+    uint32_t                    gap_window_count;
+    uint32_t                    gap_window_idx;
+    uint32_t                    gtsd_since_update;
+    uint64_t                    gtsd_p95_baseline_us;
 } xqc_wifi_iface_state_t;
 
 struct xqc_wifi_monitor_s {
@@ -68,6 +85,175 @@ xqc_wifi_clip_prob(double value)
         return 1.0 - 1e-9;
     }
     return value;
+}
+
+static double
+xqc_wifi_clip_double(double value, double low, double high)
+{
+    if (value < low) {
+        return low;
+    }
+    if (value > high) {
+        return high;
+    }
+    return value;
+}
+
+static int
+xqc_wifi_u32_cmp(const void *a, const void *b)
+{
+    uint32_t av = *(const uint32_t *) a;
+    uint32_t bv = *(const uint32_t *) b;
+
+    if (av < bv) {
+        return -1;
+    }
+    if (av > bv) {
+        return 1;
+    }
+    return 0;
+}
+
+static uint32_t
+xqc_wifi_quantile_u32(const uint32_t *values, uint32_t count, double q)
+{
+    uint32_t sorted[XQC_WIFI_GTSD_WINDOW_SIZE];
+    uint32_t idx;
+
+    if (values == NULL || count == 0) {
+        return 0;
+    }
+
+    if (count > XQC_WIFI_GTSD_WINDOW_SIZE) {
+        count = XQC_WIFI_GTSD_WINDOW_SIZE;
+    }
+
+    memcpy(sorted, values, count * sizeof(uint32_t));
+    qsort(sorted, count, sizeof(uint32_t), xqc_wifi_u32_cmp);
+
+    idx = (uint32_t) ceil(q * ((double) count - 1.0));
+    if (idx >= count) {
+        idx = count - 1;
+    }
+
+    return sorted[idx];
+}
+
+static int
+xqc_wifi_gtsd_tail_guard(const xqc_wifi_iface_state_t *iface_state)
+{
+    uint64_t p95_guard;
+
+    if (iface_state == NULL || iface_state->gtsd_p95_baseline_us == 0) {
+        return 0;
+    }
+
+    p95_guard = iface_state->gtsd_p95_baseline_us * XQC_WIFI_GTSD_P95_REL_GUARD;
+    if (p95_guard < iface_state->gtsd_p95_baseline_us + XQC_WIFI_GTSD_P95_ABS_GUARD_US) {
+        p95_guard = iface_state->gtsd_p95_baseline_us + XQC_WIFI_GTSD_P95_ABS_GUARD_US;
+    }
+
+    return iface_state->snapshot.tail_p95_us >= p95_guard;
+}
+
+static void
+xqc_wifi_gtsd_update(xqc_wifi_iface_state_t *iface_state, uint32_t gap_us)
+{
+    xqc_wifi_state_snapshot_t *snapshot;
+    uint32_t p50;
+    uint32_t p95;
+    double ratio;
+    double excess = 0.0;
+    double evidence;
+    int tail_guard;
+
+    if (iface_state == NULL || gap_us == 0) {
+        return;
+    }
+
+    snapshot = &iface_state->snapshot;
+    iface_state->gap_window[iface_state->gap_window_idx] = gap_us;
+    iface_state->gap_window_idx =
+        (iface_state->gap_window_idx + 1) % XQC_WIFI_GTSD_WINDOW_SIZE;
+    if (iface_state->gap_window_count < XQC_WIFI_GTSD_WINDOW_SIZE) {
+        iface_state->gap_window_count++;
+    }
+
+    if (iface_state->gap_window_count < XQC_WIFI_GTSD_WINDOW_SIZE) {
+        snapshot->state = XQC_WIFI_PATH_STATE_UNKNOWN;
+        return;
+    }
+
+    if (snapshot->gtsd_calibrated && ++iface_state->gtsd_since_update < XQC_WIFI_GTSD_UPDATE_STRIDE) {
+        return;
+    }
+    iface_state->gtsd_since_update = 0;
+
+    p50 = xqc_wifi_quantile_u32(iface_state->gap_window,
+        iface_state->gap_window_count, 0.50);
+    p95 = xqc_wifi_quantile_u32(iface_state->gap_window,
+        iface_state->gap_window_count, 0.95);
+    ratio = p50 > 0 ? (double) p95 / (double) p50 : 0.0;
+
+    snapshot->tail_p50_us = p50;
+    snapshot->tail_p95_us = p95;
+    snapshot->tail_ratio = ratio;
+
+    if (!snapshot->gtsd_calibrated) {
+        snapshot->gtsd_calibrated = 1;
+        snapshot->tail_baseline =
+            xqc_wifi_clip_double(ratio, XQC_WIFI_GTSD_R0_MIN, XQC_WIFI_GTSD_R0_MAX);
+        iface_state->gtsd_p95_baseline_us = p95;
+        snapshot->tail_excess = 0.0;
+        snapshot->cusum_on = 0.0;
+        snapshot->cusum_off = 0.0;
+        snapshot->state = XQC_WIFI_PATH_STATE_REGULAR;
+        return;
+    }
+
+    if (snapshot->tail_baseline > 0.0) {
+        excess = ratio / snapshot->tail_baseline - 1.0;
+    }
+    snapshot->tail_excess = excess;
+
+    tail_guard = xqc_wifi_gtsd_tail_guard(iface_state);
+    if (snapshot->state != XQC_WIFI_PATH_STATE_DEGRADED_CSMA) {
+        if (tail_guard) {
+            evidence = xqc_wifi_clip_double(excess, -1.0, XQC_WIFI_GTSD_ON_EXCESS_CAP)
+                       - XQC_WIFI_GTSD_ON_DELTA;
+        } else {
+            evidence = -XQC_WIFI_GTSD_ON_DELTA;
+        }
+
+        snapshot->cusum_on = xqc_wifi_clip_double(snapshot->cusum_on + evidence,
+            0.0, XQC_WIFI_GTSD_ON_THRESHOLD);
+        snapshot->cusum_off = 0.0;
+
+        if (snapshot->cusum_on >= XQC_WIFI_GTSD_ON_THRESHOLD) {
+            snapshot->state = XQC_WIFI_PATH_STATE_DEGRADED_CSMA;
+            snapshot->cusum_off = 0.0;
+        } else {
+            snapshot->state = XQC_WIFI_PATH_STATE_REGULAR;
+        }
+
+        return;
+    }
+
+    if (!tail_guard && excess <= XQC_WIFI_GTSD_CLEAR_THRESHOLD) {
+        evidence = xqc_wifi_clip_double(XQC_WIFI_GTSD_CLEAR_THRESHOLD - excess,
+            0.0, XQC_WIFI_GTSD_OFF_EVIDENCE_CAP);
+    } else {
+        evidence = 0.0;
+    }
+
+    snapshot->cusum_off = xqc_wifi_clip_double(snapshot->cusum_off + evidence,
+        0.0, XQC_WIFI_GTSD_OFF_THRESHOLD);
+    snapshot->cusum_on = 0.0;
+
+    if (snapshot->cusum_off >= XQC_WIFI_GTSD_OFF_THRESHOLD) {
+        snapshot->state = XQC_WIFI_PATH_STATE_REGULAR;
+        snapshot->cusum_on = 0.0;
+    }
 }
 
 static xqc_wifi_iface_state_t *
@@ -179,8 +365,6 @@ xqc_wifi_update_iface_state(xqc_wifi_monitor_t *monitor,
     static const double p1 = 0.15;
     static const double q01 = 0.001;
     static const double q10 = 0.01;
-    static const double theta_high = 0.8;
-    static const double theta_low = 0.2;
     static const double ewma_alpha = 0.05;
 
     xqc_wifi_iface_state_t *iface_state;
@@ -254,24 +438,7 @@ xqc_wifi_update_iface_state(xqc_wifi_monitor_t *monitor,
     log_odds = log(pi_pred / (1.0 - pi_pred)) + log_lr;
     iface_state->snapshot.pi_degraded = 1.0 / (1.0 + exp(-log_odds));
 
-    if (iface_state->snapshot.sample_count < XQC_WIFI_MONITOR_MIN_SAMPLES) {
-        iface_state->snapshot.state = XQC_WIFI_PATH_STATE_UNKNOWN;
-
-    } else if (old_state == XQC_WIFI_PATH_STATE_UNKNOWN) {
-        iface_state->snapshot.state = iface_state->snapshot.pi_degraded >= theta_high
-            ? XQC_WIFI_PATH_STATE_DEGRADED_CSMA
-            : XQC_WIFI_PATH_STATE_REGULAR;
-
-    } else if (old_state == XQC_WIFI_PATH_STATE_REGULAR
-        && iface_state->snapshot.pi_degraded >= theta_high)
-    {
-        iface_state->snapshot.state = XQC_WIFI_PATH_STATE_DEGRADED_CSMA;
-
-    } else if (old_state == XQC_WIFI_PATH_STATE_DEGRADED_CSMA
-        && iface_state->snapshot.pi_degraded <= theta_low)
-    {
-        iface_state->snapshot.state = XQC_WIFI_PATH_STATE_REGULAR;
-    }
+    xqc_wifi_gtsd_update(iface_state, event->gap);
 
     xqc_wifi_emit_state_locked(monitor, iface_state, ts_us,
         iface_state->snapshot.state != old_state);

@@ -153,7 +153,10 @@ if(XQC_ENABLE_WIFI_MONITOR AND NOT CMAKE_SYSTEM_NAME MATCHES "Windows")
 
     add_custom_command(
         OUTPUT "${XQC_WIFI_MONITOR_SKEL}" "${XQC_WIFI_MONITOR_LIBBPF}"
-        COMMAND ${CMAKE_MAKE_PROGRAM} -C "${XQC_WIFI_MONITOR_DIR}" .output/monitor.skel.h .output/libbpf.a
+        COMMAND ${CMAKE_MAKE_PROGRAM} -C "${XQC_WIFI_MONITOR_DIR}" .output/monitor.skel.h
+        COMMAND ${CMAKE_COMMAND} -E copy_if_different
+            "${XQC_WIFI_MONITOR_OUTPUT}/libbpf/libbpf.a"
+            "${XQC_WIFI_MONITOR_LIBBPF}"
         DEPENDS
             "${XQC_WIFI_MONITOR_DIR}/monitor.c"
             "${XQC_WIFI_MONITOR_DIR}/monitor.bpf.c"
@@ -276,7 +279,9 @@ set(
     "src/transport/scheduler/xqc_scheduler_rap.c"
     "src/transport/scheduler/xqc_scheduler_rr.c"
     "src/transport/scheduler/xqc_scheduler_redundant.c"
+    "src/transport/scheduler/xqc_scheduler_copy.c"
     "src/transport/scheduler/xqc_scheduler_blest.c"
+    "src/transport/scheduler/xqc_scheduler_xlink.c"
 )
 
 if(XQC_ENABLE_WIFI_MONITOR AND NOT CMAKE_SYSTEM_NAME MATCHES "Windows")

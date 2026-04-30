@@ -212,7 +212,9 @@ set(
     "src/transport/scheduler/xqc_scheduler_rap.c"
     "src/transport/scheduler/xqc_scheduler_rr.c"
     "src/transport/scheduler/xqc_scheduler_redundant.c"
+    "src/transport/scheduler/xqc_scheduler_copy.c"
     "src/transport/scheduler/xqc_scheduler_blest.c"
+    "src/transport/scheduler/xqc_scheduler_xlink.c"
 )
 
 if(XQC_ENABLE_MP_INTEROP)
