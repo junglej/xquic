@@ -19,6 +19,7 @@
 #include <xquic/xqc_http3.h>
 #include "platform.h"
 #include "src/transport/monitor/xqc_wifi_monitor.h"
+#include "src/transport/scheduler/xqc_scheduler_mac_aware.h"
 #include "src/transport/scheduler/xqc_scheduler_observer.h"
 #include "src/transport/xqc_stream.h"
 #ifndef XQC_SYS_WINDOWS
@@ -621,9 +622,9 @@ xqc_test_cli_open_aux_trace_files(client_ctx_t *c)
     c->send_trace_fd = xqc_test_cli_open_aux_csv(c->send_trace_path,
         "ts_us,conn,path_id,path_seq,ifname,ifindex,fd,len,quic_form,quic_type,quic_dcid,quic_pn_raw,quic_pn_len");
     c->wifi_state_fd = xqc_test_cli_open_aux_csv(c->wifi_state_path,
-        "ts_us,conn,path_id,path_seq,ifname,ifindex,wifi_state,pi_degraded,p_long_gap,r_eff_Bpus,last_gap_us,ewma_gap_us,ewma_airtime_us,ewma_burst_bytes,sample_count,last_update_ts_us,gtsd_calibrated,tail_p50_us,tail_p95_us,tail_ratio,tail_baseline,tail_excess,cusum_on,cusum_off");
+        "ts_us,conn,path_id,path_seq,ifname,ifindex,wifi_state,pi_degraded,p_long_gap,r_eff_Bpus,last_gap_us,last_mac_rtt_us,ewma_gap_us,ewma_airtime_us,ewma_mac_rtt_us,ewma_burst_bytes,sample_count,last_update_ts_us,gtsd_calibrated,tail_p50_us,tail_p95_us,tail_ratio,tail_baseline,tail_excess,cusum_on,cusum_off");
     c->scheduler_trace_fd = xqc_test_cli_open_aux_csv(c->scheduler_trace_path,
-        "ts_us,conn,scheduler,selected_path_id,selected_ifname,selected_ifindex,selected_on_degraded,other_cleaner,path0_id,path0_ifname,path0_ifindex,path0_srtt_us,path0_cwnd_bytes,path0_bytes_in_flight,path0_can_send,path0_path_state,path0_app_status,path0_wifi_state,path0_pi,path0_p_long_gap,path0_last_gap_us,path0_r_eff_Bpus,path0_gtsd_calibrated,path0_tail_p50_us,path0_tail_p95_us,path0_tail_ratio,path0_tail_baseline,path0_tail_excess,path0_cusum_on,path0_cusum_off,path1_id,path1_ifname,path1_ifindex,path1_srtt_us,path1_cwnd_bytes,path1_bytes_in_flight,path1_can_send,path1_path_state,path1_app_status,path1_wifi_state,path1_pi,path1_p_long_gap,path1_last_gap_us,path1_r_eff_Bpus,path1_gtsd_calibrated,path1_tail_p50_us,path1_tail_p95_us,path1_tail_ratio,path1_tail_baseline,path1_tail_excess,path1_cusum_on,path1_cusum_off");
+        "ts_us,conn,scheduler,selected_path_id,selected_ifname,selected_ifindex,selected_on_degraded,other_cleaner,path0_id,path0_ifname,path0_ifindex,path0_srtt_us,path0_cwnd_bytes,path0_bytes_in_flight,path0_can_send,path0_path_state,path0_app_status,path0_wifi_state,path0_pi,path0_p_long_gap,path0_last_gap_us,path0_r_eff_Bpus,path0_gtsd_calibrated,path0_tail_p50_us,path0_tail_p95_us,path0_tail_ratio,path0_tail_baseline,path0_tail_excess,path0_cusum_on,path0_cusum_off,path1_id,path1_ifname,path1_ifindex,path1_srtt_us,path1_cwnd_bytes,path1_bytes_in_flight,path1_can_send,path1_path_state,path1_app_status,path1_wifi_state,path1_pi,path1_p_long_gap,path1_last_gap_us,path1_r_eff_Bpus,path1_gtsd_calibrated,path1_tail_p50_us,path1_tail_p95_us,path1_tail_ratio,path1_tail_baseline,path1_tail_excess,path1_cusum_on,path1_cusum_off,decision_reason,risk_reason,selected_pi,selected_tail_excess,selected_last_mac_rtt_us,selected_ewma_mac_rtt_us,selected_ewma_gap_us,selected_ewma_airtime_us,selected_ewma_burst_bytes,selected_r_eff_Bpus,path0_last_mac_rtt_us,path0_ewma_mac_rtt_us,path0_ewma_gap_us,path0_ewma_airtime_us,path0_ewma_burst_bytes,path1_last_mac_rtt_us,path1_ewma_mac_rtt_us,path1_ewma_gap_us,path1_ewma_airtime_us,path1_ewma_burst_bytes,path0_scheduler_high_risk,path0_scheduler_risk_reason,path1_scheduler_high_risk,path1_scheduler_risk_reason,base_candidate_ifname,admission_candidate_ifname,eta_clean_us,eta_risky_us,eta_delta_us,predicted_reorder_bytes,selected_service_cost_us_per_kib,risky_service_cost_us_per_kib,quota_tokens_bytes,service_tokens_bytes,reorder_debt_bytes,risk_inflight_debt_bytes,risk_inflight_budget_bytes,admission_allowed,service_admission_selected,admission_block_reason");
     if (g_transport == 1) {
         xqc_test_cli_build_aux_path(g_log_path, XQC_TEST_CLI_STREAM_TRACE_SUFFIX,
             c->stream_trace_path, sizeof(c->stream_trace_path));
@@ -930,7 +931,7 @@ xqc_test_cli_log_wifi_state_snapshot(client_ctx_t *c, xqc_user_path_t *path,
     }
 
     snprintf(line, sizeof(line),
-        "%"PRIu64",%p,%"PRIu64",%d,%s,%u,%s,%.6f,%.6f,%.6f,%"PRIu64",%.3f,%.3f,%.3f,%"PRIu64",%"PRIu64",%u,%"PRIu64",%"PRIu64",%.6f,%.6f,%.6f,%.6f,%.6f",
+        "%"PRIu64",%p,%"PRIu64",%d,%s,%u,%s,%.6f,%.6f,%.6f,%"PRIu64",%"PRIu64",%.3f,%.3f,%.3f,%.3f,%"PRIu64",%"PRIu64",%u,%"PRIu64",%"PRIu64",%.6f,%.6f,%.6f,%.6f,%.6f",
         snapshot->ts_us,
         path ? path->user_conn : NULL,
         path ? path->path_id : 0,
@@ -942,8 +943,10 @@ xqc_test_cli_log_wifi_state_snapshot(client_ctx_t *c, xqc_user_path_t *path,
         snapshot->p_long_gap,
         snapshot->r_eff_Bpus,
         snapshot->last_gap_us,
+        snapshot->last_mac_rtt_us,
         snapshot->ewma_gap_us,
         snapshot->ewma_airtime_us,
+        snapshot->ewma_mac_rtt_us,
         snapshot->ewma_burst_bytes,
         snapshot->sample_count,
         snapshot->last_update_ts_us,
@@ -969,6 +972,10 @@ xqc_test_cli_wifi_state_update_cb(const xqc_wifi_state_snapshot_t *snapshot, voi
     }
 
     path = xqc_test_cli_find_path_by_ifname(snapshot->ifname);
+    if (path != NULL && path->user_conn != NULL) {
+        xqc_mac_aware_scheduler_update_path_state(path->user_conn,
+            path->path_id, snapshot);
+    }
     xqc_test_cli_log_wifi_state_snapshot(c, path, snapshot);
 }
 
@@ -987,6 +994,8 @@ xqc_test_cli_scheduler_observer_cb(const xqc_scheduler_observation_t *observatio
         uint8_t can_send;
         uint8_t path_state;
         uint8_t app_path_status;
+        uint8_t scheduler_high_risk;
+        const char *scheduler_risk_reason;
         xqc_wifi_state_snapshot_t wifi_snapshot;
         int has_wifi_snapshot;
     } xqc_test_cli_sched_row_path_t;
@@ -998,9 +1007,11 @@ xqc_test_cli_scheduler_observer_cb(const xqc_scheduler_observation_t *observatio
     int selected_on_degraded = 0;
     int other_cleaner = 0;
     int i;
-    char line[4096];
+    char line[8192];
     const char *selected_ifname = "-";
     unsigned int selected_ifindex = 0;
+    const char *base_candidate_ifname = "-";
+    const char *admission_candidate_ifname = "-";
 
     if (c == NULL || observation == NULL || c->scheduler_trace_fd <= 0) {
         return;
@@ -1027,6 +1038,8 @@ xqc_test_cli_scheduler_observer_cb(const xqc_scheduler_observation_t *observatio
         rows[slot].can_send = src->can_send;
         rows[slot].path_state = src->path_state;
         rows[slot].app_path_status = src->app_path_status;
+        rows[slot].scheduler_high_risk = src->scheduler_high_risk;
+        rows[slot].scheduler_risk_reason = src->scheduler_risk_reason;
 
         if (c->wifi_monitor != NULL && path != NULL && path->ifname[0] != '\0'
             && xqc_wifi_monitor_get_snapshot(c->wifi_monitor, path->ifname,
@@ -1039,6 +1052,16 @@ xqc_test_cli_scheduler_observer_cb(const xqc_scheduler_observation_t *observatio
             selected_idx = slot;
             selected_ifname = rows[slot].ifname;
             selected_ifindex = rows[slot].ifindex;
+        }
+        if (observation->has_base_candidate
+            && observation->base_candidate_path_id == src->path_id)
+        {
+            base_candidate_ifname = rows[slot].ifname;
+        }
+        if (observation->has_admission_candidate
+            && observation->admission_candidate_path_id == src->path_id)
+        {
+            admission_candidate_ifname = rows[slot].ifname;
         }
 
         if (slot + 1 > row_count) {
@@ -1074,7 +1097,11 @@ xqc_test_cli_scheduler_observer_cb(const xqc_scheduler_observation_t *observatio
     snprintf(line, sizeof(line),
         "%"PRIu64",%p,%s,%"PRIu64",%s,%u,%d,%d,"
         "%"PRIu64",%s,%u,%"PRIu64",%"PRIu64",%"PRIu64",%u,%u,%u,%s,%.6f,%.6f,%"PRIu64",%.6f,%u,%"PRIu64",%"PRIu64",%.6f,%.6f,%.6f,%.6f,%.6f,"
-        "%"PRIu64",%s,%u,%"PRIu64",%"PRIu64",%"PRIu64",%u,%u,%u,%s,%.6f,%.6f,%"PRIu64",%.6f,%u,%"PRIu64",%"PRIu64",%.6f,%.6f,%.6f,%.6f,%.6f",
+        "%"PRIu64",%s,%u,%"PRIu64",%"PRIu64",%"PRIu64",%u,%u,%u,%s,%.6f,%.6f,%"PRIu64",%.6f,%u,%"PRIu64",%"PRIu64",%.6f,%.6f,%.6f,%.6f,%.6f,"
+        "%s,%s,%.6f,%.6f,%"PRIu64",%.3f,%.3f,%.3f,%.3f,%.6f,"
+        "%"PRIu64",%.3f,%.3f,%.3f,%.3f,%"PRIu64",%.3f,%.3f,%.3f,%.3f,%u,%s,%u,%s,"
+        "%s,%s,%"PRIu64",%"PRIu64",%"PRIu64",%.3f,%.3f,%.3f,"
+        "%"PRIu64",%"PRIu64",%"PRIu64",%"PRIu64",%"PRIu64",%u,%u,%s",
         observation->ts_us,
         observation->conn_user_data,
         observation->scheduler_name ? observation->scheduler_name : "-",
@@ -1126,7 +1153,56 @@ xqc_test_cli_scheduler_observer_cb(const xqc_scheduler_observation_t *observatio
         rows[1].has_wifi_snapshot ? rows[1].wifi_snapshot.tail_baseline : 0.0,
         rows[1].has_wifi_snapshot ? rows[1].wifi_snapshot.tail_excess : 0.0,
         rows[1].has_wifi_snapshot ? rows[1].wifi_snapshot.cusum_on : 0.0,
-        rows[1].has_wifi_snapshot ? rows[1].wifi_snapshot.cusum_off : 0.0);
+        rows[1].has_wifi_snapshot ? rows[1].wifi_snapshot.cusum_off : 0.0,
+        observation->decision_reason ? observation->decision_reason : "normal",
+        observation->risk_reason ? observation->risk_reason : "none",
+        selected_idx >= 0 && rows[selected_idx].has_wifi_snapshot
+            ? rows[selected_idx].wifi_snapshot.pi_degraded : 0.0,
+        selected_idx >= 0 && rows[selected_idx].has_wifi_snapshot
+            ? rows[selected_idx].wifi_snapshot.tail_excess : 0.0,
+        selected_idx >= 0 && rows[selected_idx].has_wifi_snapshot
+            ? rows[selected_idx].wifi_snapshot.last_mac_rtt_us : 0,
+        selected_idx >= 0 && rows[selected_idx].has_wifi_snapshot
+            ? rows[selected_idx].wifi_snapshot.ewma_mac_rtt_us : 0.0,
+        selected_idx >= 0 && rows[selected_idx].has_wifi_snapshot
+            ? rows[selected_idx].wifi_snapshot.ewma_gap_us : 0.0,
+        selected_idx >= 0 && rows[selected_idx].has_wifi_snapshot
+            ? rows[selected_idx].wifi_snapshot.ewma_airtime_us : 0.0,
+        selected_idx >= 0 && rows[selected_idx].has_wifi_snapshot
+            ? rows[selected_idx].wifi_snapshot.ewma_burst_bytes : 0.0,
+        selected_idx >= 0 && rows[selected_idx].has_wifi_snapshot
+            ? rows[selected_idx].wifi_snapshot.r_eff_Bpus : 0.0,
+        rows[0].has_wifi_snapshot ? rows[0].wifi_snapshot.last_mac_rtt_us : 0,
+        rows[0].has_wifi_snapshot ? rows[0].wifi_snapshot.ewma_mac_rtt_us : 0.0,
+        rows[0].has_wifi_snapshot ? rows[0].wifi_snapshot.ewma_gap_us : 0.0,
+        rows[0].has_wifi_snapshot ? rows[0].wifi_snapshot.ewma_airtime_us : 0.0,
+        rows[0].has_wifi_snapshot ? rows[0].wifi_snapshot.ewma_burst_bytes : 0.0,
+        rows[1].has_wifi_snapshot ? rows[1].wifi_snapshot.last_mac_rtt_us : 0,
+        rows[1].has_wifi_snapshot ? rows[1].wifi_snapshot.ewma_mac_rtt_us : 0.0,
+        rows[1].has_wifi_snapshot ? rows[1].wifi_snapshot.ewma_gap_us : 0.0,
+        rows[1].has_wifi_snapshot ? rows[1].wifi_snapshot.ewma_airtime_us : 0.0,
+        rows[1].has_wifi_snapshot ? rows[1].wifi_snapshot.ewma_burst_bytes : 0.0,
+        (unsigned) rows[0].scheduler_high_risk,
+        rows[0].scheduler_risk_reason ? rows[0].scheduler_risk_reason : "none",
+        (unsigned) rows[1].scheduler_high_risk,
+        rows[1].scheduler_risk_reason ? rows[1].scheduler_risk_reason : "none",
+        base_candidate_ifname,
+        admission_candidate_ifname,
+        observation->eta_clean_us,
+        observation->eta_risky_us,
+        observation->eta_delta_us,
+        observation->predicted_reorder_bytes,
+        observation->selected_service_cost_us_per_kib,
+        observation->risky_service_cost_us_per_kib,
+        observation->quota_tokens_bytes,
+        observation->service_tokens_bytes,
+        observation->reorder_debt_bytes,
+        observation->risk_inflight_debt_bytes,
+        observation->risk_inflight_budget_bytes,
+        (unsigned) observation->admission_allowed,
+        (unsigned) observation->service_admission_selected,
+        observation->admission_block_reason
+            ? observation->admission_block_reason : "no_estimate");
     xqc_test_cli_write_aux_line(c->scheduler_trace_fd, line);
 }
 
@@ -1264,14 +1340,12 @@ xqc_test_cli_apply_scheduler_name(const char *name, xqc_conn_settings_t *conn_se
         return 0;
     }
 
-    if (strcasecmp(name, "copy") == 0
-        || strcasecmp(name, "csma_copy") == 0
-        || strcasecmp(name, "csma-copy") == 0)
+    if (strcasecmp(name, "mac_aware") == 0
+        || strcasecmp(name, "mac-aware") == 0
+        || strcasecmp(name, "mac_service") == 0
+        || strcasecmp(name, "mac-service") == 0)
     {
-        conn_settings->scheduler_callback = xqc_copy_scheduler_cb;
-        conn_settings->reinj_ctl_callback = xqc_redundant_reinj_ctl_cb;
-        conn_settings->mp_enable_reinjection |= XQC_REINJ_UNACK_AFTER_SEND
-                                                | XQC_REINJ_UNACK_MULTI_PATH;
+        conn_settings->scheduler_callback = xqc_mac_aware_scheduler_cb;
         return 0;
     }
 
@@ -1329,7 +1403,9 @@ xqc_test_cli_apply_scheduler_side_effects(const char *name)
     {
         g_enable_fec = 1;
         g_mp_backup_mode = 1;
+        return;
     }
+
 }
 /*
  CDF file format:
@@ -2893,6 +2969,7 @@ xqc_client_conn_close_notify(xqc_connection_t *conn, const xqc_cid_t *cid, void 
     DEBUG;
 
     user_conn_t *user_conn = (user_conn_t *)user_data;
+    xqc_mac_aware_scheduler_clear_conn_state(user_conn);
 
     client_ctx_t *p_ctx;
     if (g_test_qch_mode) {
@@ -5273,7 +5350,7 @@ void usage(int argc, char *argv[]) {
 "   -y    multipath backup path standby.\n"
 "   -z    periodically send request.\n"
 "   -S    request per second.\n"
-"   --scheduler             Multipath scheduler: minrtt|backup|rap|rr|roundrobin|red|redundant|copy|csma_copy|xlink|blest|interop|backup_fec.\n"
+"   --scheduler             Multipath scheduler: minrtt|backup|rap|rr|roundrobin|red|redundant|mac_aware|xlink|blest|interop|backup_fec.\n"
 "   --wifi-monitor          Enable transport Wi-Fi monitor and CSV traces.\n"
 "   --wifi-monitor-out      Output directory for eBPF Wi-Fi artifacts.\n"
 "   --wifi-monitor-config   Config path for the Wi-Fi monitor runtime.\n"

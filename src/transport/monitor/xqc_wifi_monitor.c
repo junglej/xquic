@@ -398,12 +398,14 @@ xqc_wifi_update_iface_state(xqc_wifi_monitor_t *monitor,
 
     old_state = iface_state->snapshot.state;
     iface_state->snapshot.last_gap_us = event->gap;
+    iface_state->snapshot.last_mac_rtt_us = event->mac_rtt_us;
     iface_state->snapshot.last_update_ts_us = ts_us;
     iface_state->snapshot.sample_count++;
 
     if (iface_state->snapshot.sample_count == 1) {
         iface_state->snapshot.ewma_gap_us = event->gap;
         iface_state->snapshot.ewma_airtime_us = event->airtime;
+        iface_state->snapshot.ewma_mac_rtt_us = event->mac_rtt_us;
         iface_state->snapshot.ewma_burst_bytes = burst_bytes;
         iface_state->ewma_long_gap = long_gap;
         iface_state->snapshot.pi_degraded = 0.0;
@@ -415,6 +417,9 @@ xqc_wifi_update_iface_state(xqc_wifi_monitor_t *monitor,
         iface_state->snapshot.ewma_airtime_us =
             ewma_alpha * (double) event->airtime
             + (1.0 - ewma_alpha) * iface_state->snapshot.ewma_airtime_us;
+        iface_state->snapshot.ewma_mac_rtt_us =
+            ewma_alpha * (double) event->mac_rtt_us
+            + (1.0 - ewma_alpha) * iface_state->snapshot.ewma_mac_rtt_us;
         iface_state->snapshot.ewma_burst_bytes =
             ewma_alpha * burst_bytes
             + (1.0 - ewma_alpha) * iface_state->snapshot.ewma_burst_bytes;
@@ -617,6 +622,7 @@ xqc_wifi_monitor_merge_mgmt(xqc_wifi_monitor_t *monitor)
         }
 
         fclose(src);
+        unlink(src_path);
     }
 
     fclose(dst);

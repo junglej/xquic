@@ -19,6 +19,8 @@ typedef struct xqc_scheduler_path_snapshot_s {
     uint8_t     path_state;
     uint8_t     app_path_status;
     uint8_t     path_class;
+    uint8_t     scheduler_high_risk;
+    const char  *scheduler_risk_reason;
 } xqc_scheduler_path_snapshot_t;
 
 typedef struct xqc_scheduler_observation_s {
@@ -29,7 +31,27 @@ typedef struct xqc_scheduler_observation_s {
     uint64_t                        packet_number;
     size_t                          packet_size;
     uint64_t                        selected_path_id;
+    const char                      *decision_reason;
+    const char                      *risk_reason;
+    uint64_t                        base_candidate_path_id;
+    uint64_t                        admission_candidate_path_id;
+    uint64_t                        eta_clean_us;
+    uint64_t                        eta_risky_us;
+    uint64_t                        eta_delta_us;
+    double                          predicted_reorder_bytes;
+    double                          selected_service_cost_us_per_kib;
+    double                          risky_service_cost_us_per_kib;
+    uint64_t                        quota_tokens_bytes;
+    uint64_t                        service_tokens_bytes;
+    uint64_t                        reorder_debt_bytes;
+    uint64_t                        risk_inflight_debt_bytes;
+    uint64_t                        risk_inflight_budget_bytes;
+    uint8_t                         admission_allowed;
+    uint8_t                         service_admission_selected;
+    const char                      *admission_block_reason;
     uint8_t                         has_selected_path;
+    uint8_t                         has_base_candidate;
+    uint8_t                         has_admission_candidate;
     uint8_t                         path_count;
     xqc_scheduler_path_snapshot_t   paths[XQC_SCHED_OBS_MAX_PATHS];
 } xqc_scheduler_observation_t;

@@ -227,14 +227,12 @@ xqc_test_svr_apply_scheduler_name(const char *name, xqc_conn_settings_t *conn_se
         return 0;
     }
 
-    if (strcasecmp(name, "copy") == 0
-        || strcasecmp(name, "csma_copy") == 0
-        || strcasecmp(name, "csma-copy") == 0)
+    if (strcasecmp(name, "mac_aware") == 0
+        || strcasecmp(name, "mac-aware") == 0
+        || strcasecmp(name, "mac_service") == 0
+        || strcasecmp(name, "mac-service") == 0)
     {
-        conn_settings->scheduler_callback = xqc_copy_scheduler_cb;
-        conn_settings->reinj_ctl_callback = xqc_redundant_reinj_ctl_cb;
-        conn_settings->mp_enable_reinjection |= XQC_REINJ_UNACK_AFTER_SEND
-                                                | XQC_REINJ_UNACK_MULTI_PATH;
+        conn_settings->scheduler_callback = xqc_mac_aware_scheduler_cb;
         return 0;
     }
 
@@ -2865,7 +2863,7 @@ void usage(int argc, char *argv[]) {
 "   --request_trace_full          Log every request read_notify row.\n"
 "   --stream_trace_sample_ms <n>  Sample clean transport stream trace every n ms.\n"
 "   --stream_trace_full           Log every transport stream read_notify row.\n"
-"   --scheduler <name>            Multipath scheduler: minrtt|backup|rap|rr|roundrobin|red|redundant|copy|csma_copy|xlink|blest|interop|backup_fec.\n"
+"   --scheduler <name>            Multipath scheduler: minrtt|backup|rap|rr|roundrobin|red|redundant|mac_aware|xlink|blest|interop|backup_fec.\n"
 , prog);
 }
 

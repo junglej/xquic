@@ -72,7 +72,9 @@ XQUIC_VERS_1.0 {
         xqc_backup_scheduler_cb;
         xqc_backup_fec_scheduler_cb;
         xqc_rap_scheduler_cb;
-        xqc_copy_scheduler_cb;
+        xqc_mac_aware_scheduler_cb;
+        xqc_mac_aware_scheduler_update_path_state;
+        xqc_mac_aware_scheduler_clear_conn_state;
         xquic_scheduler_xlink;
         xqc_conn_is_ready_to_send_early_data;
         xqc_h3_conn_send_ping;

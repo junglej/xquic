@@ -47,6 +47,9 @@ xqc_scheduler_observation_init(xqc_scheduler_observation_t *observation,
     observation->scheduler_name = scheduler_name;
     observation->packet_number = packet_number;
     observation->packet_size = packet_size;
+    observation->decision_reason = "normal";
+    observation->risk_reason = "none";
+    observation->admission_block_reason = "no_estimate";
 }
 
 void
