@@ -16,12 +16,18 @@ typedef struct xqc_wifi_state_snapshot_s {
     xqc_wifi_path_state_t   state;
     double                  pi_degraded;
     double                  p_long_gap;
+    double                  service_rate_bytes_per_us;
     double                  r_eff_Bpus;
     uint64_t                last_gap_us;
     uint64_t                last_mac_rtt_us;
+    uint64_t                last_service_bytes;
+    uint64_t                last_amsdu_bytes;
+    uint32_t                last_amsdu_subframes;
     double                  ewma_gap_us;
     double                  ewma_airtime_us;
     double                  ewma_mac_rtt_us;
+    double                  ewma_service_bytes;
+    double                  ewma_service_time_us;
     double                  ewma_burst_bytes;
     uint64_t                sample_count;
     uint64_t                last_update_ts_us;

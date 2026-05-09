@@ -47,7 +47,7 @@ xqc_redundant_reinj_can_reinject(void *ctl,
         return XQC_FALSE;
     }
 
-    return xqc_scheduler_has_unsent_usable_path(rctl->conn, po);
+    return xqc_scheduler_has_unsent_sendable_path(rctl->conn, po, 1);
 }
 
 const xqc_reinj_ctl_callback_t xqc_redundant_reinj_ctl_cb = {

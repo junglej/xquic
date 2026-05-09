@@ -195,8 +195,8 @@ xqc_demo_wifi_update_iface_state(xqc_demo_wifi_monitor_t *monitor,
     xqc_demo_wifi_path_state_t old_state;
     unsigned long long sec = 0, nsec = 0;
     uint64_t ts_us;
-    uint64_t burst_frames;
-    double burst_bytes;
+    uint64_t service_bytes;
+    double service_time_us;
     double pi_pred;
     double log_odds;
     double log_lr;
@@ -216,19 +216,30 @@ xqc_demo_wifi_update_iface_state(xqc_demo_wifi_monitor_t *monitor,
     get_tm(event->ts_ns, offset, &sec, &nsec);
     ts_us = sec * 1000000ULL + nsec / 1000ULL;
     long_gap = event->gap > tau_us ? 1 : 0;
-    burst_frames = event->ampdu_ack_len ? event->ampdu_ack_len :
-        (event->ampdu_len ? event->ampdu_len : 1);
-    burst_bytes = (double) event->len * (double) burst_frames;
+    service_bytes = event->service_bytes;
+    if (service_bytes == 0) {
+        uint64_t mpdu_bytes = event->amsdu_bytes ? event->amsdu_bytes : event->len;
+        uint64_t burst_frames = event->ampdu_ack_len ? event->ampdu_ack_len :
+            (event->ampdu_len ? event->ampdu_len : 1);
+        service_bytes = mpdu_bytes * burst_frames;
+    }
+    service_time_us = (double) event->gap + (double) event->airtime;
 
     old_state = iface_state->snapshot.state;
     iface_state->snapshot.last_gap_us = event->gap;
+    iface_state->snapshot.last_service_bytes = service_bytes;
+    iface_state->snapshot.last_amsdu_bytes = event->amsdu_bytes;
+    iface_state->snapshot.last_amsdu_subframes = event->amsdu_subframes;
     iface_state->snapshot.last_update_ts_us = ts_us;
     iface_state->snapshot.sample_count++;
 
     if (iface_state->snapshot.sample_count == 1) {
         iface_state->snapshot.ewma_gap_us = event->gap;
         iface_state->snapshot.ewma_airtime_us = event->airtime;
-        iface_state->snapshot.ewma_burst_bytes = burst_bytes;
+        iface_state->snapshot.ewma_service_bytes = (double) service_bytes;
+        iface_state->snapshot.ewma_service_time_us = service_time_us;
+        iface_state->snapshot.ewma_burst_bytes =
+            iface_state->snapshot.ewma_service_bytes;
         iface_state->ewma_long_gap = long_gap;
         iface_state->snapshot.pi_degraded = 0.0;
 
@@ -239,19 +250,26 @@ xqc_demo_wifi_update_iface_state(xqc_demo_wifi_monitor_t *monitor,
         iface_state->snapshot.ewma_airtime_us =
             ewma_alpha * (double) event->airtime
             + (1.0 - ewma_alpha) * iface_state->snapshot.ewma_airtime_us;
+        iface_state->snapshot.ewma_service_bytes =
+            ewma_alpha * (double) service_bytes
+            + (1.0 - ewma_alpha) * iface_state->snapshot.ewma_service_bytes;
+        iface_state->snapshot.ewma_service_time_us =
+            ewma_alpha * service_time_us
+            + (1.0 - ewma_alpha) * iface_state->snapshot.ewma_service_time_us;
         iface_state->snapshot.ewma_burst_bytes =
-            ewma_alpha * burst_bytes
-            + (1.0 - ewma_alpha) * iface_state->snapshot.ewma_burst_bytes;
+            iface_state->snapshot.ewma_service_bytes;
         iface_state->ewma_long_gap =
             ewma_alpha * (double) long_gap
             + (1.0 - ewma_alpha) * iface_state->ewma_long_gap;
     }
 
     iface_state->snapshot.p_long_gap = iface_state->ewma_long_gap;
-    if ((iface_state->snapshot.ewma_gap_us + iface_state->snapshot.ewma_airtime_us) > 0.0) {
+    if (iface_state->snapshot.ewma_service_time_us > 0.0) {
+        iface_state->snapshot.service_rate_bytes_per_us =
+            iface_state->snapshot.ewma_service_bytes
+            / iface_state->snapshot.ewma_service_time_us;
         iface_state->snapshot.r_eff_Bpus =
-            iface_state->snapshot.ewma_burst_bytes
-            / (iface_state->snapshot.ewma_gap_us + iface_state->snapshot.ewma_airtime_us);
+            iface_state->snapshot.service_rate_bytes_per_us;
     }
 
     pi_pred = iface_state->snapshot.pi_degraded * (1.0 - q10)
@@ -372,7 +390,7 @@ xqc_demo_wifi_monitor_open_outputs(xqc_demo_wifi_monitor_t *monitor)
     XQC_DEMO_OPEN_FILE(fp_wifi_rx, "wifi_rx_trace.csv",
         "ts,skb_addr,len,frame_control,type,subtype,seq_ctrl,wifi_seq,frag,retry,more_frag,from_ds,to_ds,qos_tid,current_ap_known,current_bssid,bssid_match_src,ethertype,l3_proto,src_ip,src_port,dst_ip,dst_port,tcp_seq,skb_data_len,skb_head_len,skb_data_offset,skb_protocol_raw,network_header,transport_header,submit_stage,ip_parse_ok,tcp_parse_ok,data_first32_len,data_first32_hex,addr1,addr2,addr3");
     XQC_DEMO_OPEN_FILE(fp_mac_tx, "mac80211_tx.csv",
-        "flow_id,skb_addr,tx_ifindex,ts,src_ip,src_port,dst_ip,dst_port,protocol,tcp_seq,ampdu,len,quic_form,quic_type,quic_dcid,quic_pn_raw,quic_pn_len");
+        "flow_id,skb_addr,tx_ifindex,ts,src_ip,src_port,dst_ip,dst_port,protocol,tcp_seq,ampdu,len,amsdu_subframes,amsdu_bytes,quic_form,quic_type,quic_dcid,quic_pn_raw,quic_pn_len");
     XQC_DEMO_OPEN_FILE(fp_retrans, "retrans_trace.csv",
         "ts,src_ip,src_port,dst_ip,dst_port,seq,len,segs,ca_state");
     XQC_DEMO_OPEN_FILE(fp_tcp_loss, "tcp_loss.csv",

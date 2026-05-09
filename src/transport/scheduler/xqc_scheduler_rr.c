@@ -41,13 +41,14 @@ xqc_rr_path_quota(xqc_rr_scheduler_t *rr, xqc_path_ctx_t *path)
 }
 
 static xqc_bool_t
-xqc_rr_path_can_be_used(xqc_path_ctx_t *path, xqc_packet_out_t *packet_out, int reinject)
+xqc_rr_path_can_be_used(xqc_connection_t *conn, xqc_path_ctx_t *path,
+    xqc_packet_out_t *packet_out, int reinject)
 {
     if (!xqc_scheduler_path_is_usable(path)) {
         return XQC_FALSE;
     }
 
-    if (reinject && packet_out->po_path_id == path->path_id) {
+    if (reinject && xqc_scheduler_packet_has_path(conn, packet_out, path->path_id)) {
         return XQC_FALSE;
     }
 
@@ -64,7 +65,7 @@ xqc_rr_reset_round(xqc_rr_scheduler_t *rr, xqc_connection_t *conn,
 
     xqc_list_for_each_safe(pos, next, &conn->conn_paths_list) {
         path = xqc_list_entry(pos, xqc_path_ctx_t, path_list);
-        if (!xqc_rr_path_can_be_used(path, packet_out, reinject)) {
+        if (!xqc_rr_path_can_be_used(conn, path, packet_out, reinject)) {
             continue;
         }
 
@@ -141,7 +142,7 @@ retry:
             xqc_scheduler_observe_path(&observation, path, 0, xqc_path_get_perf_class(path));
         }
 
-        if (!xqc_rr_path_can_be_used(path, packet_out, reinject)) {
+        if (!xqc_rr_path_can_be_used(conn, path, packet_out, reinject)) {
             goto skip_path;
         }
 

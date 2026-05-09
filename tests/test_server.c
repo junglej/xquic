@@ -209,6 +209,18 @@ xqc_test_svr_apply_scheduler_name(const char *name, xqc_conn_settings_t *conn_se
         return 0;
     }
 
+    if (strcasecmp(name, "macrtt_rap") == 0
+        || strcasecmp(name, "macrtt-rap") == 0)
+    {
+        conn_settings->scheduler_callback = xqc_macrtt_rap_scheduler_cb;
+        return 0;
+    }
+
+    if (strcasecmp(name, "musher") == 0) {
+        conn_settings->scheduler_callback = xqc_musher_scheduler_cb;
+        return 0;
+    }
+
     if (strcasecmp(name, "rr") == 0
         || strcasecmp(name, "roundrobin") == 0
         || strcasecmp(name, "round-robin") == 0)
@@ -2863,7 +2875,7 @@ void usage(int argc, char *argv[]) {
 "   --request_trace_full          Log every request read_notify row.\n"
 "   --stream_trace_sample_ms <n>  Sample clean transport stream trace every n ms.\n"
 "   --stream_trace_full           Log every transport stream read_notify row.\n"
-"   --scheduler <name>            Multipath scheduler: minrtt|backup|rap|rr|roundrobin|red|redundant|mac_aware|xlink|blest|interop|backup_fec.\n"
+"   --scheduler <name>            Multipath scheduler: minrtt|backup|rap|macrtt_rap|musher|rr|roundrobin|red|redundant|mac_aware|xlink|blest|interop|backup_fec.\n"
 , prog);
 }
 

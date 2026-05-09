@@ -110,8 +110,9 @@ xqc_redundant_scheduler_get_path(void *scheduler,
         conn->user_data, packet_out->po_pkt.pkt_num, packet_out->po_used_size);
     observation.ts_us = xqc_monotonic_timestamp();
 
-    if (!reinject) {
-        red->next_path_id = 0;
+    if (reinject && !xqc_scheduler_packet_redundancy_allowed(packet_out)) {
+        xqc_scheduler_notify_observer(&observation);
+        return NULL;
     }
 
     xqc_list_for_each_safe(pos, next, &conn->conn_paths_list) {

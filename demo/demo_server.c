@@ -1231,7 +1231,7 @@ xqc_demo_svr_usage(int argc, char *argv[])
             "   -i    use interop mode\n"
             "   -M    enable MPQUIC.\n"
             "   -P    enable MPQUIC to return ACK_MPs on any paths.\n"
-            "   -s    multipath scheduler (interop, minrtt, backup), default: interop\n"
+            "   -s    multipath scheduler (interop, minrtt, backup, macrtt_rap, musher, mac_aware), default: interop\n"
             "   -R    Reinjection (1,2,4) \n"
             "   -u    Keyupdate packet threshold\n"
             "   -F    MTU size (default: 1200)\n"
@@ -1508,6 +1508,14 @@ xqc_demo_svr_init_conn_settings(xqc_engine_t *engine, xqc_demo_svr_args_t *args)
     xqc_scheduler_callback_t sched = {0};
     if (strncmp(args->quic_cfg.mp_sched, "minrtt", strlen("minrtt")) == 0) {
         sched = xqc_minrtt_scheduler_cb;
+
+    } else if (strncmp(args->quic_cfg.mp_sched, "macrtt_rap", strlen("macrtt_rap")) == 0
+               || strncmp(args->quic_cfg.mp_sched, "macrtt-rap", strlen("macrtt-rap")) == 0)
+    {
+        sched = xqc_macrtt_rap_scheduler_cb;
+
+    } else if (strncmp(args->quic_cfg.mp_sched, "musher", strlen("musher")) == 0) {
+        sched = xqc_musher_scheduler_cb;
 
     } else if (strncmp(args->quic_cfg.mp_sched, "backup", strlen("backup")) == 0) {
         sched = xqc_backup_scheduler_cb;

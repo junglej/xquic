@@ -128,6 +128,10 @@ xqc_conn_reinject_unack_packets(xqc_connection_t *conn, xqc_reinjection_mode_t m
     xqc_list_for_each_safe(pos, next, &conn->conn_send_queue->sndq_unacked_packets[XQC_PNS_APP_DATA]) {
         packet_out = xqc_list_entry(pos, xqc_packet_out_t, po_list);
 
+        if (xqc_send_ctl_indirectly_ack_or_drop_po(conn, packet_out)) {
+            continue;
+        }
+
         reinj_budget = multi_path_reinj ? XQC_MAX_PATHS_COUNT : 1;
         while (reinj_budget > 0
             && conn->reinj_callback

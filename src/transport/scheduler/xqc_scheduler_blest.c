@@ -236,7 +236,7 @@ xqc_blest_pick_minrtt_path(xqc_blest_scheduler_t *blest, xqc_connection_t *conn,
                 continue;
             }
 
-            if (reinject && packet_out->po_path_id == path->path_id) {
+            if (reinject && xqc_scheduler_packet_has_path(conn, packet_out, path->path_id)) {
                 continue;
             }
 

@@ -11,6 +11,10 @@
 
 extern const xqc_scheduler_callback_t xqc_mac_aware_scheduler_cb;
 
+int xqc_mac_aware_scheduler_get_path_state(void *conn_user_data,
+    uint64_t path_id, uint64_t now, xqc_wifi_state_snapshot_t *snapshot,
+    xqc_bool_t *high_risk, uint8_t *risk_reason_bits);
+
 XQC_EXPORT_PUBLIC_API
 void xqc_mac_aware_scheduler_update_path_state(void *conn_user_data,
     uint64_t path_id, const xqc_wifi_state_snapshot_t *snapshot);

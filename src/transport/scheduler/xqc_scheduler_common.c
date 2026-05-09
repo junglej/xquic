@@ -36,6 +36,29 @@ xqc_scheduler_path_is_standby(xqc_path_ctx_t *path)
 }
 
 xqc_bool_t
+xqc_scheduler_packet_is_acked_or_dropped(xqc_packet_out_t *packet_out)
+{
+    xqc_packet_out_t *origin;
+
+    if (packet_out == NULL) {
+        return XQC_TRUE;
+    }
+
+    origin = packet_out->po_origin != NULL ? packet_out->po_origin : packet_out;
+    if (packet_out->po_acked || origin->po_acked) {
+        return XQC_TRUE;
+    }
+
+    if ((packet_out->po_flag & XQC_POF_DROPPED_DGRAM)
+        || (origin->po_flag & XQC_POF_DROPPED_DGRAM))
+    {
+        return XQC_TRUE;
+    }
+
+    return XQC_FALSE;
+}
+
+xqc_bool_t
 xqc_scheduler_packet_redundancy_allowed(xqc_packet_out_t *packet_out)
 {
     xqc_frame_type_bit_t eligible_frames;
@@ -44,7 +67,13 @@ xqc_scheduler_packet_redundancy_allowed(xqc_packet_out_t *packet_out)
         return XQC_FALSE;
     }
 
-    if (packet_out->po_flag & XQC_POF_REINJECTED_REPLICA) {
+    if (xqc_scheduler_packet_is_acked_or_dropped(packet_out)) {
+        return XQC_FALSE;
+    }
+
+    if (packet_out->po_origin != NULL
+        || (packet_out->po_flag & XQC_POF_REINJECTED_REPLICA))
+    {
         return XQC_FALSE;
     }
 
@@ -175,6 +204,13 @@ xqc_scheduler_packet_has_path(xqc_connection_t *conn, xqc_packet_out_t *packet_o
 xqc_bool_t
 xqc_scheduler_has_unsent_usable_path(xqc_connection_t *conn, xqc_packet_out_t *packet_out)
 {
+    return xqc_scheduler_has_unsent_sendable_path(conn, packet_out, 0);
+}
+
+xqc_bool_t
+xqc_scheduler_has_unsent_sendable_path(xqc_connection_t *conn,
+    xqc_packet_out_t *packet_out, int check_cwnd)
+{
     uint64_t used_mask;
     xqc_list_head_t *pos, *next;
     xqc_path_ctx_t *path;
@@ -192,6 +228,11 @@ xqc_scheduler_has_unsent_usable_path(xqc_connection_t *conn, xqc_packet_out_t *p
         }
 
         if ((used_mask & (1ULL << path->path_id)) == 0) {
+            if (check_cwnd
+                && !xqc_scheduler_check_path_can_send(path, packet_out, check_cwnd))
+            {
+                continue;
+            }
             return XQC_TRUE;
         }
     }

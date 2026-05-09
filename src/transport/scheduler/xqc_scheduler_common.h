@@ -19,6 +19,11 @@ xqc_bool_t xqc_scheduler_packet_has_path(xqc_connection_t *conn, xqc_packet_out_
 
 xqc_bool_t xqc_scheduler_has_unsent_usable_path(xqc_connection_t *conn, xqc_packet_out_t *packet_out);
 
+xqc_bool_t xqc_scheduler_has_unsent_sendable_path(xqc_connection_t *conn,
+    xqc_packet_out_t *packet_out, int check_cwnd);
+
+xqc_bool_t xqc_scheduler_packet_is_acked_or_dropped(xqc_packet_out_t *packet_out);
+
 void xqc_scheduler_observe_path(xqc_scheduler_observation_t *observation, xqc_path_ctx_t *path,
     uint8_t can_send, uint8_t path_class);
 
