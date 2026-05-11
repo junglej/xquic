@@ -259,6 +259,7 @@ set(
     "src/transport/xqc_frame.c"
     "src/transport/xqc_recv_record.c"
     "src/transport/xqc_pacing.c"
+    "src/transport/xqc_transport_trace.c"
     "src/transport/xqc_utils.c"
     "src/transport/xqc_multipath.c"
     "src/transport/xqc_defs.c"

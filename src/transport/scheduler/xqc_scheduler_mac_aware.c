@@ -1,71 +1,51 @@
 #include "src/transport/scheduler/xqc_scheduler_mac_aware.h"
 #include "src/transport/scheduler/xqc_scheduler_common.h"
 #include "src/transport/scheduler/xqc_scheduler_observer.h"
+#include "src/transport/xqc_frame.h"
+#include "src/transport/xqc_multipath.h"
+#include "src/transport/xqc_packet_out.h"
+#include "src/transport/xqc_send_queue.h"
 #include "src/transport/xqc_send_ctl.h"
+#include "src/transport/xqc_transport_trace.h"
 
 #include <pthread.h>
+#include <limits.h>
+#include <stdint.h>
 #include <stdlib.h>
 #include <string.h>
 
 #define XQC_MAC_AWARE_MAX_PATH_STATES 32
+#define XQC_MAC_AWARE_MAX_CANDIDATES 8
 #define XQC_MAC_AWARE_STALE_US 2000000ULL
-#define XQC_MAC_AWARE_PROBE_INTERVAL_US 500000ULL
-#define XQC_MAC_AWARE_RISK_MAC_RTT_US 20000ULL
-#define XQC_MAC_AWARE_RISK_TAIL_EXCESS 1.0
-#define XQC_MAC_AWARE_DEFAULT_ENTER_BAD_SAMPLES 1U
-#define XQC_MAC_AWARE_DEFAULT_EXIT_GOOD_SAMPLES 1U
-#define XQC_MAC_AWARE_OFO_BUDGET_BYTES 1048576ULL
-#define XQC_MAC_AWARE_RISK_INFLIGHT_BUDGET_BYTES 262144ULL
-#define XQC_MAC_AWARE_RISK_INFLIGHT_BUDGET_PCT 75U
-#define XQC_MAC_AWARE_DEBT_DECAY_GAIN_PCT 100U
-#define XQC_MAC_AWARE_PROBE_BYTES 12000ULL
-#define XQC_MAC_AWARE_PROBE_BUDGET_BYTES 65536ULL
-#define XQC_MAC_AWARE_SERVICE_QUANTUM_CAP_BYTES 262144ULL
-#define XQC_MAC_AWARE_TAIL_BUDGET_BYTES 8388608ULL
-#define XQC_MAC_AWARE_RQ_LOW_FACTOR 1.0
-#define XQC_MAC_AWARE_RQ_HIGH_FACTOR 2.0
-#define XQC_MAC_AWARE_RTT_STALE_US 1000000ULL
-#define XQC_MAC_AWARE_MIN_CC_HEADROOM_BYTES 1200ULL
 
-#define XQC_MAC_AWARE_RISK_REASON_DEGRADED 0x01
-#define XQC_MAC_AWARE_RISK_REASON_TAIL     0x02
-#define XQC_MAC_AWARE_RISK_REASON_MAC_RTT  0x04
-
-typedef enum xqc_mac_aware_mode_e {
-    XQC_MAC_AWARE_MODE_STRICT_GUARD = 0,
-    XQC_MAC_AWARE_MODE_TAIL_RESERVOIR = 1,
-} xqc_mac_aware_mode_t;
-
-typedef enum xqc_mac_aware_risk_state_e {
-    XQC_MAC_AWARE_RISK_STATE_CLEAN = 0,
-    XQC_MAC_AWARE_RISK_STATE_COLD = 1,
-    XQC_MAC_AWARE_RISK_STATE_PROBING = 2,
-    XQC_MAC_AWARE_RISK_STATE_WARM = 3,
-    XQC_MAC_AWARE_RISK_STATE_CC_BLOCKED = 4,
-    XQC_MAC_AWARE_RISK_STATE_RECOVERY = 5,
-} xqc_mac_aware_risk_state_t;
+#define XQC_MAC_AWARE_DEFAULT_BURST_K 2.0
+#define XQC_MAC_AWARE_DEFAULT_MIN_BURST_BYTES 12000ULL
+#define XQC_MAC_AWARE_DEFAULT_MAX_BURST_BYTES 49152ULL
+#define XQC_MAC_AWARE_DEFAULT_BOOTSTRAP_BURST_BYTES 12000ULL
+#define XQC_MAC_AWARE_DEFAULT_MIN_MAC_SAMPLES 8ULL
+#define XQC_MAC_AWARE_DEFAULT_SERVICE_QUANTUM_CAP_BYTES 262144ULL
+#define XQC_MAC_AWARE_DEFAULT_OFO_BUDGET_BYTES 1048576ULL
+#define XQC_MAC_AWARE_DEFAULT_RQ_LOW_FACTOR 1.0
+#define XQC_MAC_AWARE_DEFAULT_RQ_HIGH_FACTOR 2.0
+#define XQC_MAC_AWARE_OFFSET_OWNER_SLOTS 16
+#define XQC_MAC_AWARE_DEFAULT_OFFSET_OWNER 0
+#define XQC_MAC_AWARE_DEFAULT_OFFSET_CHUNK_BYTES 49152ULL
+#define XQC_MAC_AWARE_DEFAULT_OFFSET_MAX_CHUNK_BYTES 262144ULL
 
 typedef struct xqc_mac_aware_config_s {
-    xqc_mac_aware_mode_t mode;
-    uint64_t             probe_interval_us;
-    uint64_t             mac_rtt_threshold_us;
-    double               tail_excess_threshold;
-    uint32_t             enter_bad_samples;
-    uint32_t             exit_good_samples;
-    uint64_t             ofo_budget_bytes;
-    uint64_t             risk_inflight_budget_bytes;
-    uint32_t             risk_inflight_budget_pct;
-    uint32_t             debt_decay_gain_pct;
-    uint8_t              tail_reservoir_enable;
-    uint64_t             probe_bytes;
-    uint64_t             probe_budget_bytes;
-    uint64_t             min_probe_interval_us;
-    uint64_t             service_quantum_cap_bytes;
-    double               rq_low_factor;
-    double               rq_high_factor;
-    uint64_t             tail_budget_bytes;
-    uint64_t             rtt_stale_us;
-    uint64_t             min_cc_headroom_bytes;
+    double      burst_k;
+    uint64_t    min_burst_bytes;
+    uint64_t    max_burst_bytes;
+    uint64_t    bootstrap_burst_bytes;
+    uint64_t    min_mac_samples;
+    uint64_t    service_quantum_cap_bytes;
+    uint64_t    ofo_budget_bytes;
+    double      rq_low_factor;
+    double      rq_high_factor;
+    uint8_t     use_gap_in_eta;
+    uint8_t     offset_owner_enabled;
+    uint64_t    offset_chunk_bytes;
+    uint64_t    offset_max_chunk_bytes;
 } xqc_mac_aware_config_t;
 
 typedef struct xqc_mac_aware_path_state_s {
@@ -74,50 +54,52 @@ typedef struct xqc_mac_aware_path_state_s {
     uint64_t                    path_id;
     xqc_wifi_state_snapshot_t   snapshot;
     uint64_t                    updated_at_us;
-    uint64_t                    last_probe_at_us;
-    uint8_t                     high_risk;
-    uint8_t                     risk_reason_bits;
-    uint32_t                    bad_sample_count;
-    uint32_t                    clean_sample_count;
-    double                      arrival_debt_bytes;
-    uint64_t                    arrival_debt_updated_at_us;
-    uint8_t                     risk_state;
-    uint64_t                    rq_bytes;
-    uint64_t                    rq_low_bytes;
-    uint64_t                    rq_high_bytes;
+    uint64_t                    sample_count;
     uint64_t                    service_quantum_bytes;
-    uint64_t                    last_service_at_us;
-    uint64_t                    outstanding_probe_bytes;
-    uint64_t                    tail_admitted_bytes;
-    uint64_t                    tail_budget_used_bytes;
+    uint64_t                    observed_service_bytes;
+    uint64_t                    mac_rtt_us;
+    uint64_t                    gap_us;
+    uint64_t                    last_selected_at_us;
 } xqc_mac_aware_path_state_t;
+
+typedef struct xqc_mac_aware_offset_owner_s {
+    uint8_t     used;
+    uint64_t    stream_id;
+    uint64_t    next_offset;
+    uint64_t    path_id;
+    uint64_t    remaining_bytes;
+} xqc_mac_aware_offset_owner_t;
+
+typedef struct xqc_mac_aware_scheduler_s {
+    uint64_t    burst_path_id;
+    uint64_t    burst_remaining_bytes;
+    xqc_mac_aware_offset_owner_t
+                offset_owners[XQC_MAC_AWARE_OFFSET_OWNER_SLOTS];
+} xqc_mac_aware_scheduler_t;
 
 typedef struct xqc_mac_aware_candidate_s {
     xqc_path_ctx_t             *path;
     xqc_wifi_state_snapshot_t   snapshot;
     xqc_bool_t                  has_snapshot;
+    uint64_t                    sample_count;
     uint64_t                    srtt_us;
-    uint64_t                    mac_rtt_us;
-    uint64_t                    tail_p95_us;
-    uint64_t                    service_bytes;
-    double                      service_rate_bytes_per_us;
-    uint8_t                     risk_reason_bits;
-    uint8_t                     instant_risk_reason_bits;
-    xqc_path_perf_class_t       path_class;
-    uint8_t                     risk_state;
+    uint64_t                    latest_rtt_us;
+    uint64_t                    ack_age_us;
     uint64_t                    cwnd_bytes;
     uint64_t                    inflight_bytes;
     uint64_t                    cc_headroom_bytes;
-    uint64_t                    latest_rtt_us;
-    uint64_t                    ack_age_us;
-    uint8_t                     rtt_stale;
-    uint64_t                    rq_bytes;
-    uint64_t                    rq_low_bytes;
-    uint64_t                    rq_high_bytes;
+    uint64_t                    backlog_bytes;
+    uint64_t                    pending_intent_bytes;
     uint64_t                    service_quantum_bytes;
-    uint64_t                    last_probe_at_us;
-    uint64_t                    tail_budget_used_bytes;
-    uint8_t                     recovery_probe_due;
+    uint64_t                    observed_service_bytes;
+    uint64_t                    mac_rtt_us;
+    uint64_t                    gap_us;
+    double                      service_rate_bytes_per_us;
+    uint64_t                    queue_quanta;
+    uint64_t                    eta_us;
+    uint64_t                    burst_budget_bytes;
+    uint64_t                    last_selected_at_us;
+    xqc_path_perf_class_t       path_class;
 } xqc_mac_aware_candidate_t;
 
 static xqc_mac_aware_path_state_t g_mac_aware_path_states[XQC_MAC_AWARE_MAX_PATH_STATES];
@@ -125,12 +107,12 @@ static pthread_mutex_t g_mac_aware_path_states_lock = PTHREAD_MUTEX_INITIALIZER;
 static pthread_once_t g_mac_aware_config_once = PTHREAD_ONCE_INIT;
 static xqc_mac_aware_config_t g_mac_aware_config;
 
-static uint64_t
-xqc_mac_aware_snapshot_service_bytes(const xqc_wifi_state_snapshot_t *snapshot);
-
-static uint64_t
-xqc_mac_aware_service_quantum_bytes(const xqc_wifi_state_snapshot_t *snapshot,
-    const xqc_mac_aware_config_t *config);
+static xqc_mac_aware_candidate_t *xqc_mac_aware_select_candidate(
+    xqc_mac_aware_candidate_t *candidates, uint8_t candidate_count,
+    const xqc_mac_aware_config_t *config, const char **decision_reason);
+static xqc_mac_aware_candidate_t *xqc_mac_aware_alt_candidate(
+    xqc_mac_aware_candidate_t *candidates, uint8_t candidate_count,
+    const xqc_mac_aware_candidate_t *selected);
 
 static uint64_t
 xqc_mac_aware_env_u64(const char *name, uint64_t default_value)
@@ -170,115 +152,89 @@ xqc_mac_aware_env_double(const char *name, double default_value)
     return parsed;
 }
 
-static xqc_mac_aware_mode_t
-xqc_mac_aware_env_mode(void)
-{
-    const char *value = getenv("MAC_AWARE_MODE");
-
-    if (value == NULL || value[0] == '\0') {
-        return XQC_MAC_AWARE_MODE_STRICT_GUARD;
-    }
-    if (strcmp(value, "tail_reservoir") == 0
-        || strcmp(value, "tail-reservoir") == 0)
-    {
-        return XQC_MAC_AWARE_MODE_TAIL_RESERVOIR;
-    }
-
-    return XQC_MAC_AWARE_MODE_STRICT_GUARD;
-}
-
 static void
 xqc_mac_aware_config_init_once(void)
 {
     memset(&g_mac_aware_config, 0, sizeof(g_mac_aware_config));
-    g_mac_aware_config.mode = xqc_mac_aware_env_mode();
-    g_mac_aware_config.probe_interval_us =
-        xqc_mac_aware_env_u64("MAC_AWARE_PROBE_INTERVAL_US",
-            XQC_MAC_AWARE_PROBE_INTERVAL_US);
-    g_mac_aware_config.mac_rtt_threshold_us =
-        xqc_mac_aware_env_u64("MAC_AWARE_MAC_RTT_THRESHOLD_US",
-            xqc_mac_aware_env_u64("MAC_AWARE_RISK_MAC_RTT_US",
-                XQC_MAC_AWARE_RISK_MAC_RTT_US));
-    g_mac_aware_config.tail_excess_threshold =
-        xqc_mac_aware_env_double("MAC_AWARE_TAIL_EXCESS_THRESHOLD",
-            xqc_mac_aware_env_double("MAC_AWARE_RISK_TAIL_EXCESS",
-                XQC_MAC_AWARE_RISK_TAIL_EXCESS));
-    g_mac_aware_config.enter_bad_samples =
-        (uint32_t) xqc_mac_aware_env_u64("MAC_AWARE_ENTER_BAD_SAMPLES",
-            XQC_MAC_AWARE_DEFAULT_ENTER_BAD_SAMPLES);
-    g_mac_aware_config.exit_good_samples =
-        (uint32_t) xqc_mac_aware_env_u64("MAC_AWARE_EXIT_GOOD_SAMPLES",
-            XQC_MAC_AWARE_DEFAULT_EXIT_GOOD_SAMPLES);
-    g_mac_aware_config.ofo_budget_bytes =
-        xqc_mac_aware_env_u64("MAC_AWARE_OFO_BUDGET_BYTES",
-            xqc_mac_aware_env_u64("MAC_AWARE_REORDER_BUDGET_BYTES",
-                XQC_MAC_AWARE_OFO_BUDGET_BYTES));
-    g_mac_aware_config.risk_inflight_budget_bytes =
-        xqc_mac_aware_env_u64("MAC_AWARE_RISK_INFLIGHT_BUDGET_BYTES",
-            XQC_MAC_AWARE_RISK_INFLIGHT_BUDGET_BYTES);
-    g_mac_aware_config.risk_inflight_budget_pct =
-        (uint32_t) xqc_mac_aware_env_u64("MAC_AWARE_RISK_INFLIGHT_BUDGET_PCT",
-            XQC_MAC_AWARE_RISK_INFLIGHT_BUDGET_PCT);
-    g_mac_aware_config.debt_decay_gain_pct =
-        (uint32_t) xqc_mac_aware_env_u64("MAC_AWARE_DEBT_DECAY_GAIN_PCT",
-            XQC_MAC_AWARE_DEBT_DECAY_GAIN_PCT);
-    g_mac_aware_config.tail_reservoir_enable =
-        xqc_mac_aware_env_u64("MAC_AWARE_TAIL_RESERVOIR_ENABLE",
-            g_mac_aware_config.mode == XQC_MAC_AWARE_MODE_TAIL_RESERVOIR
-                ? 1 : 0) ? 1 : 0;
-    g_mac_aware_config.probe_bytes =
-        xqc_mac_aware_env_u64("MAC_AWARE_PROBE_BYTES",
-            XQC_MAC_AWARE_PROBE_BYTES);
-    g_mac_aware_config.probe_budget_bytes =
-        xqc_mac_aware_env_u64("MAC_AWARE_PROBE_BUDGET_BYTES",
-            XQC_MAC_AWARE_PROBE_BUDGET_BYTES);
-    g_mac_aware_config.min_probe_interval_us =
-        xqc_mac_aware_env_u64("MAC_AWARE_MIN_PROBE_INTERVAL_US",
-            g_mac_aware_config.probe_interval_us);
-    g_mac_aware_config.service_quantum_cap_bytes =
-        xqc_mac_aware_env_u64("MAC_AWARE_SERVICE_QUANTUM_CAP_BYTES",
-            XQC_MAC_AWARE_SERVICE_QUANTUM_CAP_BYTES);
-    g_mac_aware_config.rq_low_factor =
-        xqc_mac_aware_env_double("MAC_AWARE_RQ_LOW_FACTOR",
-            XQC_MAC_AWARE_RQ_LOW_FACTOR);
-    g_mac_aware_config.rq_high_factor =
-        xqc_mac_aware_env_double("MAC_AWARE_RQ_HIGH_FACTOR",
-            XQC_MAC_AWARE_RQ_HIGH_FACTOR);
-    g_mac_aware_config.tail_budget_bytes =
-        xqc_mac_aware_env_u64("MAC_AWARE_TAIL_BUDGET_BYTES",
-            XQC_MAC_AWARE_TAIL_BUDGET_BYTES);
-    g_mac_aware_config.rtt_stale_us =
-        xqc_mac_aware_env_u64("MAC_AWARE_RTT_STALE_US",
-            XQC_MAC_AWARE_RTT_STALE_US);
-    g_mac_aware_config.min_cc_headroom_bytes =
-        xqc_mac_aware_env_u64("MAC_AWARE_MIN_CC_HEADROOM_BYTES",
-            XQC_MAC_AWARE_MIN_CC_HEADROOM_BYTES);
 
-    if (g_mac_aware_config.probe_interval_us == 0) {
-        g_mac_aware_config.probe_interval_us = XQC_MAC_AWARE_PROBE_INTERVAL_US;
+    g_mac_aware_config.burst_k =
+        xqc_mac_aware_env_double("SQP_BURST_K",
+            XQC_MAC_AWARE_DEFAULT_BURST_K);
+    g_mac_aware_config.min_burst_bytes =
+        xqc_mac_aware_env_u64("SQP_MIN_BURST_BYTES",
+            XQC_MAC_AWARE_DEFAULT_MIN_BURST_BYTES);
+    g_mac_aware_config.max_burst_bytes =
+        xqc_mac_aware_env_u64("SQP_MAX_BURST_BYTES",
+            XQC_MAC_AWARE_DEFAULT_MAX_BURST_BYTES);
+    g_mac_aware_config.bootstrap_burst_bytes =
+        xqc_mac_aware_env_u64("SQP_BOOTSTRAP_BURST_BYTES",
+            xqc_mac_aware_env_u64("MAC_AWARE_PROBE_BYTES",
+                XQC_MAC_AWARE_DEFAULT_BOOTSTRAP_BURST_BYTES));
+    g_mac_aware_config.min_mac_samples =
+        xqc_mac_aware_env_u64("SQP_MIN_MAC_SAMPLES",
+            XQC_MAC_AWARE_DEFAULT_MIN_MAC_SAMPLES);
+    g_mac_aware_config.service_quantum_cap_bytes =
+        xqc_mac_aware_env_u64("SQP_SERVICE_QUANTUM_CAP_BYTES",
+            xqc_mac_aware_env_u64("MAC_AWARE_SERVICE_QUANTUM_CAP_BYTES",
+                XQC_MAC_AWARE_DEFAULT_SERVICE_QUANTUM_CAP_BYTES));
+    g_mac_aware_config.ofo_budget_bytes =
+        xqc_mac_aware_env_u64("SQP_OFO_BUDGET_BYTES",
+            xqc_mac_aware_env_u64("MAC_AWARE_OFO_BUDGET_BYTES",
+                XQC_MAC_AWARE_DEFAULT_OFO_BUDGET_BYTES));
+    g_mac_aware_config.rq_low_factor =
+        xqc_mac_aware_env_double("SQP_RQ_LOW_FACTOR",
+            xqc_mac_aware_env_double("MAC_AWARE_RQ_LOW_FACTOR",
+                XQC_MAC_AWARE_DEFAULT_RQ_LOW_FACTOR));
+    g_mac_aware_config.rq_high_factor =
+        xqc_mac_aware_env_double("SQP_RQ_HIGH_FACTOR",
+            xqc_mac_aware_env_double("MAC_AWARE_RQ_HIGH_FACTOR",
+                XQC_MAC_AWARE_DEFAULT_RQ_HIGH_FACTOR));
+    g_mac_aware_config.use_gap_in_eta =
+        xqc_mac_aware_env_u64("SQP_USE_GAP_IN_ETA", 0) ? 1 : 0;
+    g_mac_aware_config.offset_owner_enabled =
+        xqc_mac_aware_env_u64("MAC_AWARE_OFFSET_OWNER",
+            XQC_MAC_AWARE_DEFAULT_OFFSET_OWNER) ? 1 : 0;
+    g_mac_aware_config.offset_chunk_bytes =
+        xqc_mac_aware_env_u64("MAC_AWARE_OFFSET_CHUNK_BYTES",
+            XQC_MAC_AWARE_DEFAULT_OFFSET_CHUNK_BYTES);
+    g_mac_aware_config.offset_max_chunk_bytes =
+        xqc_mac_aware_env_u64("MAC_AWARE_OFFSET_MAX_CHUNK_BYTES",
+            XQC_MAC_AWARE_DEFAULT_OFFSET_MAX_CHUNK_BYTES);
+    if (g_mac_aware_config.burst_k <= 0.0) {
+        g_mac_aware_config.burst_k = XQC_MAC_AWARE_DEFAULT_BURST_K;
     }
-    if (g_mac_aware_config.enter_bad_samples == 0) {
-        g_mac_aware_config.enter_bad_samples = 1;
+    if (g_mac_aware_config.min_burst_bytes == 0) {
+        g_mac_aware_config.min_burst_bytes =
+            XQC_MAC_AWARE_DEFAULT_MIN_BURST_BYTES;
     }
-    if (g_mac_aware_config.exit_good_samples == 0) {
-        g_mac_aware_config.exit_good_samples = 1;
+    if (g_mac_aware_config.max_burst_bytes
+        < g_mac_aware_config.min_burst_bytes)
+    {
+        g_mac_aware_config.max_burst_bytes =
+            g_mac_aware_config.min_burst_bytes;
     }
-    if (g_mac_aware_config.risk_inflight_budget_pct > 100) {
-        g_mac_aware_config.risk_inflight_budget_pct = 100;
+    if (g_mac_aware_config.bootstrap_burst_bytes
+        < g_mac_aware_config.min_burst_bytes)
+    {
+        g_mac_aware_config.bootstrap_burst_bytes =
+            g_mac_aware_config.min_burst_bytes;
     }
-    if (g_mac_aware_config.probe_bytes == 0) {
-        g_mac_aware_config.probe_bytes = XQC_MAC_AWARE_PROBE_BYTES;
+    if (g_mac_aware_config.bootstrap_burst_bytes
+        > g_mac_aware_config.max_burst_bytes)
+    {
+        g_mac_aware_config.bootstrap_burst_bytes =
+            g_mac_aware_config.max_burst_bytes;
     }
-    if (g_mac_aware_config.min_probe_interval_us == 0) {
-        g_mac_aware_config.min_probe_interval_us =
-            g_mac_aware_config.probe_interval_us;
+    if (g_mac_aware_config.min_mac_samples == 0) {
+        g_mac_aware_config.min_mac_samples = 1;
     }
     if (g_mac_aware_config.service_quantum_cap_bytes == 0) {
         g_mac_aware_config.service_quantum_cap_bytes =
-            XQC_MAC_AWARE_SERVICE_QUANTUM_CAP_BYTES;
+            XQC_MAC_AWARE_DEFAULT_SERVICE_QUANTUM_CAP_BYTES;
     }
     if (g_mac_aware_config.rq_low_factor <= 0.0) {
-        g_mac_aware_config.rq_low_factor = XQC_MAC_AWARE_RQ_LOW_FACTOR;
+        g_mac_aware_config.rq_low_factor =
+            XQC_MAC_AWARE_DEFAULT_RQ_LOW_FACTOR;
     }
     if (g_mac_aware_config.rq_high_factor
         < g_mac_aware_config.rq_low_factor)
@@ -286,8 +242,19 @@ xqc_mac_aware_config_init_once(void)
         g_mac_aware_config.rq_high_factor =
             g_mac_aware_config.rq_low_factor;
     }
-    if (g_mac_aware_config.rtt_stale_us == 0) {
-        g_mac_aware_config.rtt_stale_us = XQC_MAC_AWARE_RTT_STALE_US;
+    if (g_mac_aware_config.offset_chunk_bytes == 0) {
+        g_mac_aware_config.offset_chunk_bytes =
+            XQC_MAC_AWARE_DEFAULT_OFFSET_CHUNK_BYTES;
+    }
+    if (g_mac_aware_config.offset_max_chunk_bytes == 0) {
+        g_mac_aware_config.offset_max_chunk_bytes =
+            g_mac_aware_config.offset_chunk_bytes;
+    }
+    if (g_mac_aware_config.offset_chunk_bytes
+        > g_mac_aware_config.offset_max_chunk_bytes)
+    {
+        g_mac_aware_config.offset_chunk_bytes =
+            g_mac_aware_config.offset_max_chunk_bytes;
     }
 }
 
@@ -298,55 +265,86 @@ xqc_mac_aware_get_config(void)
     return &g_mac_aware_config;
 }
 
-static double
-xqc_mac_aware_tail_risk(const xqc_wifi_state_snapshot_t *snapshot)
+static uint64_t
+xqc_mac_aware_min_u64(uint64_t a, uint64_t b)
 {
-    if (snapshot == NULL || !snapshot->gtsd_calibrated) {
-        return 0.0;
-    }
-    return snapshot->tail_excess > 0.0 ? snapshot->tail_excess : 0.0;
+    return a < b ? a : b;
 }
 
-static uint8_t
-xqc_mac_aware_snapshot_risk_bits(const xqc_wifi_state_snapshot_t *snapshot,
-    const xqc_mac_aware_config_t *config)
+static uint64_t
+xqc_mac_aware_max_u64(uint64_t a, uint64_t b)
 {
-    uint8_t bits = 0;
-    uint64_t mac_rtt_us;
+    return a > b ? a : b;
+}
 
-    if (snapshot == NULL || config == NULL) {
+static uint64_t
+xqc_mac_aware_ceil_div_u64(uint64_t a, uint64_t b)
+{
+    if (b == 0) {
+        return 1;
+    }
+    if (a == 0) {
+        return 1;
+    }
+    return a / b + (a % b != 0);
+}
+
+static uint64_t
+xqc_mac_aware_snapshot_service_bytes(const xqc_wifi_state_snapshot_t *snapshot)
+{
+    if (snapshot == NULL) {
         return 0;
     }
-
-    mac_rtt_us = (uint64_t) snapshot->ewma_mac_rtt_us;
-    if (snapshot->state == XQC_WIFI_PATH_STATE_DEGRADED_CSMA) {
-        bits |= XQC_MAC_AWARE_RISK_REASON_DEGRADED;
+    if (snapshot->ewma_service_bytes > 0.0) {
+        return (uint64_t) snapshot->ewma_service_bytes;
     }
-    if (xqc_mac_aware_tail_risk(snapshot) >= config->tail_excess_threshold) {
-        bits |= XQC_MAC_AWARE_RISK_REASON_TAIL;
+    if (snapshot->last_service_bytes > 0) {
+        return snapshot->last_service_bytes;
     }
-    if (mac_rtt_us >= config->mac_rtt_threshold_us) {
-        bits |= XQC_MAC_AWARE_RISK_REASON_MAC_RTT;
+    if (snapshot->ewma_burst_bytes > 0.0) {
+        return (uint64_t) snapshot->ewma_burst_bytes;
     }
-
-    return bits;
+    return 0;
 }
 
-static const char *
-xqc_mac_aware_risk_reason_label(uint8_t bits)
+static uint64_t
+xqc_mac_aware_cap_service_quantum(uint64_t service_bytes,
+    const xqc_mac_aware_config_t *config)
 {
-    switch (bits) {
-    case 0:
-        return "none";
-    case XQC_MAC_AWARE_RISK_REASON_DEGRADED:
-        return "degraded_state";
-    case XQC_MAC_AWARE_RISK_REASON_TAIL:
-        return "tail_excess";
-    case XQC_MAC_AWARE_RISK_REASON_MAC_RTT:
-        return "mac_rtt";
-    default:
-        return "combined";
+    if (service_bytes == 0 || config == NULL) {
+        return 0;
     }
+    if (config->service_quantum_cap_bytes > 0
+        && service_bytes > config->service_quantum_cap_bytes)
+    {
+        return config->service_quantum_cap_bytes;
+    }
+    return service_bytes;
+}
+
+static uint64_t
+xqc_mac_aware_update_capacity_quantum(uint64_t current, uint64_t observed,
+    const xqc_mac_aware_config_t *config)
+{
+    uint64_t decayed;
+
+    observed = xqc_mac_aware_cap_service_quantum(observed, config);
+    if (observed == 0) {
+        return current;
+    }
+    if (current == 0) {
+        return observed;
+    }
+
+    decayed = current - current / 32;
+    if (decayed == current && decayed > 0) {
+        decayed--;
+    }
+
+    if (observed > decayed) {
+        return observed;
+    }
+    return xqc_mac_aware_max_u64(decayed, observed);
 }
 
 static int
@@ -403,24 +401,8 @@ xqc_mac_aware_scheduler_update_path_state(void *conn_user_data,
     uint64_t path_id, const xqc_wifi_state_snapshot_t *snapshot)
 {
     int i;
-    uint8_t high_risk = 0;
-    uint8_t risk_reason_bits = 0;
-    uint32_t bad_sample_count = 0;
-    uint32_t clean_sample_count = 0;
-    double arrival_debt_bytes = 0.0;
-    uint64_t arrival_debt_updated_at_us = 0;
-    uint64_t last_probe_at_us = 0;
-    uint8_t risk_state = XQC_MAC_AWARE_RISK_STATE_CLEAN;
-    uint64_t rq_bytes = 0;
-    uint64_t rq_low_bytes = 0;
-    uint64_t rq_high_bytes = 0;
-    uint64_t service_quantum_bytes = 0;
-    uint64_t last_service_at_us = 0;
-    uint64_t outstanding_probe_bytes = 0;
-    uint64_t tail_admitted_bytes = 0;
-    uint64_t tail_budget_used_bytes = 0;
     uint64_t now;
-    uint8_t current_risk_bits;
+    uint64_t observed_service_bytes;
     const xqc_mac_aware_config_t *config;
 
     if (conn_user_data == NULL || snapshot == NULL) {
@@ -428,104 +410,35 @@ xqc_mac_aware_scheduler_update_path_state(void *conn_user_data,
     }
 
     config = xqc_mac_aware_get_config();
-    current_risk_bits = xqc_mac_aware_snapshot_risk_bits(snapshot, config);
+    observed_service_bytes = xqc_mac_aware_snapshot_service_bytes(snapshot);
+    now = xqc_monotonic_timestamp();
 
     pthread_mutex_lock(&g_mac_aware_path_states_lock);
-    i = xqc_mac_aware_find_state_slot_locked(conn_user_data, path_id);
-    if (i < 0) {
-        i = xqc_mac_aware_alloc_state_slot_locked();
-        memset(&g_mac_aware_path_states[i], 0, sizeof(g_mac_aware_path_states[i]));
-    } else {
-        high_risk = g_mac_aware_path_states[i].high_risk;
-        risk_reason_bits = g_mac_aware_path_states[i].risk_reason_bits;
-        bad_sample_count = g_mac_aware_path_states[i].bad_sample_count;
-        clean_sample_count = g_mac_aware_path_states[i].clean_sample_count;
-        arrival_debt_bytes = g_mac_aware_path_states[i].arrival_debt_bytes;
-        arrival_debt_updated_at_us =
-            g_mac_aware_path_states[i].arrival_debt_updated_at_us;
-        last_probe_at_us = g_mac_aware_path_states[i].last_probe_at_us;
-        risk_state = g_mac_aware_path_states[i].risk_state;
-        rq_bytes = g_mac_aware_path_states[i].rq_bytes;
-        rq_low_bytes = g_mac_aware_path_states[i].rq_low_bytes;
-        rq_high_bytes = g_mac_aware_path_states[i].rq_high_bytes;
-        service_quantum_bytes =
-            g_mac_aware_path_states[i].service_quantum_bytes;
-        last_service_at_us = g_mac_aware_path_states[i].last_service_at_us;
-        outstanding_probe_bytes =
-            g_mac_aware_path_states[i].outstanding_probe_bytes;
-        tail_admitted_bytes =
-            g_mac_aware_path_states[i].tail_admitted_bytes;
-        tail_budget_used_bytes =
-            g_mac_aware_path_states[i].tail_budget_used_bytes;
-    }
-
-    if (current_risk_bits != 0) {
-        bad_sample_count++;
-        clean_sample_count = 0;
-        risk_reason_bits = current_risk_bits;
-        if (bad_sample_count >= config->enter_bad_samples) {
-            high_risk = 1;
-        }
-    } else {
-        clean_sample_count++;
-        bad_sample_count = 0;
-        if (clean_sample_count >= config->exit_good_samples) {
-            high_risk = 0;
-            risk_reason_bits = 0;
-        }
-    }
-
-    now = xqc_monotonic_timestamp();
-    service_quantum_bytes = xqc_mac_aware_service_quantum_bytes(snapshot,
-        config);
-    if (service_quantum_bytes > 0) {
-        rq_low_bytes = (uint64_t) ((double) service_quantum_bytes
-            * config->rq_low_factor);
-        rq_high_bytes = (uint64_t) ((double) service_quantum_bytes
-            * config->rq_high_factor);
-        if (rq_high_bytes < rq_low_bytes) {
-            rq_high_bytes = rq_low_bytes;
-        }
-        last_service_at_us = now;
-    } else {
-        rq_low_bytes = 0;
-        rq_high_bytes = 0;
-    }
-    if (!high_risk) {
-        risk_state = XQC_MAC_AWARE_RISK_STATE_CLEAN;
-    } else if (current_risk_bits == 0) {
-        risk_state = XQC_MAC_AWARE_RISK_STATE_RECOVERY;
-    } else if (service_quantum_bytes > 0) {
-        risk_state = XQC_MAC_AWARE_RISK_STATE_WARM;
-    } else {
-        risk_state = XQC_MAC_AWARE_RISK_STATE_COLD;
-    }
-
-    g_mac_aware_path_states[i].used = 1;
-    g_mac_aware_path_states[i].conn_user_data = conn_user_data;
-    g_mac_aware_path_states[i].path_id = path_id;
+    i = xqc_mac_aware_ensure_state_slot_locked(conn_user_data, path_id);
     g_mac_aware_path_states[i].snapshot = *snapshot;
     g_mac_aware_path_states[i].updated_at_us = now;
-    g_mac_aware_path_states[i].high_risk = high_risk;
-    g_mac_aware_path_states[i].risk_reason_bits = risk_reason_bits;
-    g_mac_aware_path_states[i].bad_sample_count = bad_sample_count;
-    g_mac_aware_path_states[i].clean_sample_count = clean_sample_count;
-    g_mac_aware_path_states[i].arrival_debt_bytes = arrival_debt_bytes;
-    g_mac_aware_path_states[i].arrival_debt_updated_at_us =
-        arrival_debt_updated_at_us;
-    g_mac_aware_path_states[i].last_probe_at_us = last_probe_at_us;
-    g_mac_aware_path_states[i].risk_state = risk_state;
-    g_mac_aware_path_states[i].rq_bytes = rq_bytes;
-    g_mac_aware_path_states[i].rq_low_bytes = rq_low_bytes;
-    g_mac_aware_path_states[i].rq_high_bytes = rq_high_bytes;
+    g_mac_aware_path_states[i].sample_count = snapshot->sample_count;
+    if (g_mac_aware_path_states[i].sample_count == 0) {
+        g_mac_aware_path_states[i].sample_count++;
+    }
+    g_mac_aware_path_states[i].observed_service_bytes =
+        observed_service_bytes;
     g_mac_aware_path_states[i].service_quantum_bytes =
-        service_quantum_bytes;
-    g_mac_aware_path_states[i].last_service_at_us = last_service_at_us;
-    g_mac_aware_path_states[i].outstanding_probe_bytes =
-        outstanding_probe_bytes;
-    g_mac_aware_path_states[i].tail_admitted_bytes = tail_admitted_bytes;
-    g_mac_aware_path_states[i].tail_budget_used_bytes =
-        tail_budget_used_bytes;
+        xqc_mac_aware_update_capacity_quantum(
+            g_mac_aware_path_states[i].service_quantum_bytes,
+            observed_service_bytes, config);
+    if (snapshot->ewma_mac_rtt_us > 0.0) {
+        g_mac_aware_path_states[i].mac_rtt_us =
+            (uint64_t) snapshot->ewma_mac_rtt_us;
+    } else if (snapshot->last_mac_rtt_us > 0) {
+        g_mac_aware_path_states[i].mac_rtt_us =
+            snapshot->last_mac_rtt_us;
+    }
+    if (snapshot->ewma_gap_us > 0.0) {
+        g_mac_aware_path_states[i].gap_us = (uint64_t) snapshot->ewma_gap_us;
+    } else if (snapshot->last_gap_us > 0) {
+        g_mac_aware_path_states[i].gap_us = snapshot->last_gap_us;
+    }
     pthread_mutex_unlock(&g_mac_aware_path_states_lock);
 }
 
@@ -566,21 +479,35 @@ xqc_mac_aware_scheduler_get_path_state(void *conn_user_data, uint64_t path_id,
     i = xqc_mac_aware_find_state_slot_locked(conn_user_data, path_id);
     if (i >= 0
         && now >= g_mac_aware_path_states[i].updated_at_us
-        && now - g_mac_aware_path_states[i].updated_at_us <= XQC_MAC_AWARE_STALE_US)
+        && now - g_mac_aware_path_states[i].updated_at_us
+            <= XQC_MAC_AWARE_STALE_US)
     {
         *snapshot = g_mac_aware_path_states[i].snapshot;
-        if (high_risk != NULL) {
-            *high_risk = g_mac_aware_path_states[i].high_risk
-                ? XQC_TRUE : XQC_FALSE;
-        }
-        if (risk_reason_bits != NULL) {
-            *risk_reason_bits = g_mac_aware_path_states[i].risk_reason_bits;
-        }
         found = XQC_TRUE;
     }
     pthread_mutex_unlock(&g_mac_aware_path_states_lock);
 
+    if (high_risk != NULL) {
+        *high_risk = XQC_FALSE;
+    }
+    if (risk_reason_bits != NULL) {
+        *risk_reason_bits = 0;
+    }
+
     return found;
+}
+
+static uint64_t
+xqc_mac_aware_path_cwnd(xqc_path_ctx_t *path)
+{
+    if (path == NULL || path->path_send_ctl == NULL
+        || path->path_send_ctl->ctl_cong_callback == NULL)
+    {
+        return 0;
+    }
+
+    return path->path_send_ctl->ctl_cong_callback->
+        xqc_cong_ctl_get_cwnd(path->path_send_ctl->ctl_cong);
 }
 
 static double
@@ -597,95 +524,46 @@ xqc_mac_aware_snapshot_service_rate(const xqc_wifi_state_snapshot_t *snapshot)
     {
         return snapshot->ewma_service_bytes / snapshot->ewma_service_time_us;
     }
-    if (snapshot->ewma_gap_us + snapshot->ewma_airtime_us > 0.0
-        && snapshot->ewma_burst_bytes > 0.0)
-    {
-        return snapshot->ewma_burst_bytes
-               / (snapshot->ewma_gap_us + snapshot->ewma_airtime_us);
-    }
     return 0.0;
-}
-
-static uint64_t
-xqc_mac_aware_snapshot_service_bytes(const xqc_wifi_state_snapshot_t *snapshot)
-{
-    if (snapshot == NULL) {
-        return 0;
-    }
-    if (snapshot->ewma_service_bytes > 0.0) {
-        return (uint64_t) snapshot->ewma_service_bytes;
-    }
-    if (snapshot->last_service_bytes > 0) {
-        return snapshot->last_service_bytes;
-    }
-    if (snapshot->ewma_burst_bytes > 0.0) {
-        return (uint64_t) snapshot->ewma_burst_bytes;
-    }
-    return 0;
-}
-
-static uint64_t
-xqc_mac_aware_service_quantum_bytes(const xqc_wifi_state_snapshot_t *snapshot,
-    const xqc_mac_aware_config_t *config)
-{
-    uint64_t service_bytes = xqc_mac_aware_snapshot_service_bytes(snapshot);
-
-    if (service_bytes == 0 || config == NULL) {
-        return 0;
-    }
-    if (config->service_quantum_cap_bytes > 0
-        && service_bytes > config->service_quantum_cap_bytes)
-    {
-        return config->service_quantum_cap_bytes;
-    }
-    return service_bytes;
-}
-
-static uint64_t
-xqc_mac_aware_path_cwnd(xqc_path_ctx_t *path)
-{
-    if (path == NULL || path->path_send_ctl == NULL
-        || path->path_send_ctl->ctl_cong_callback == NULL)
-    {
-        return 0;
-    }
-
-    return path->path_send_ctl->ctl_cong_callback->
-        xqc_cong_ctl_get_cwnd(path->path_send_ctl->ctl_cong);
 }
 
 static void
 xqc_mac_aware_candidate_update_transport(xqc_mac_aware_candidate_t *candidate,
-    uint64_t now, const xqc_mac_aware_config_t *config)
+    uint64_t now, int check_cwnd)
 {
     xqc_send_ctl_t *send_ctl;
+    uint64_t used_bytes;
 
     if (candidate == NULL || candidate->path == NULL
-        || candidate->path->path_send_ctl == NULL || config == NULL)
+        || candidate->path->path_send_ctl == NULL)
     {
         return;
     }
 
     send_ctl = candidate->path->path_send_ctl;
+    candidate->srtt_us = xqc_send_ctl_get_srtt(send_ctl);
+    candidate->latest_rtt_us = send_ctl->ctl_latest_rtt;
     candidate->cwnd_bytes = xqc_mac_aware_path_cwnd(candidate->path);
     candidate->inflight_bytes = send_ctl->ctl_bytes_in_flight;
-    candidate->cc_headroom_bytes =
-        candidate->cwnd_bytes > candidate->inflight_bytes
-        ? candidate->cwnd_bytes - candidate->inflight_bytes : 0;
-    candidate->latest_rtt_us = send_ctl->ctl_latest_rtt;
+    candidate->backlog_bytes = candidate->path->path_schedule_bytes;
     if (send_ctl->ctl_delivered_time > 0
         && now >= send_ctl->ctl_delivered_time)
     {
         candidate->ack_age_us = now - send_ctl->ctl_delivered_time;
-    } else {
-        candidate->ack_age_us = 0;
     }
-    candidate->rtt_stale = candidate->latest_rtt_us == 0
-        || candidate->ack_age_us > config->rtt_stale_us;
+
+    used_bytes = candidate->inflight_bytes + candidate->backlog_bytes;
+    if (!check_cwnd) {
+        candidate->cc_headroom_bytes = UINT64_MAX;
+    } else if (candidate->cwnd_bytes > used_bytes) {
+        candidate->cc_headroom_bytes = candidate->cwnd_bytes - used_bytes;
+    } else {
+        candidate->cc_headroom_bytes = 0;
+    }
 }
 
 static void
-xqc_mac_aware_candidate_load_scheduler_state(void *conn_user_data,
+xqc_mac_aware_candidate_load_state(void *conn_user_data,
     xqc_mac_aware_candidate_t *candidate, uint64_t now,
     const xqc_mac_aware_config_t *config)
 {
@@ -700,250 +578,109 @@ xqc_mac_aware_candidate_load_scheduler_state(void *conn_user_data,
     pthread_mutex_lock(&g_mac_aware_path_states_lock);
     i = xqc_mac_aware_find_state_slot_locked(conn_user_data,
         candidate->path->path_id);
-    if (i >= 0) {
-        candidate->risk_state = g_mac_aware_path_states[i].risk_state;
-        candidate->last_probe_at_us =
-            g_mac_aware_path_states[i].last_probe_at_us;
-        candidate->tail_budget_used_bytes =
-            g_mac_aware_path_states[i].tail_budget_used_bytes;
+    if (i >= 0
+        && now >= g_mac_aware_path_states[i].updated_at_us
+        && now - g_mac_aware_path_states[i].updated_at_us
+            <= XQC_MAC_AWARE_STALE_US)
+    {
+        candidate->has_snapshot = XQC_TRUE;
+        candidate->snapshot = g_mac_aware_path_states[i].snapshot;
+        candidate->sample_count = g_mac_aware_path_states[i].sample_count;
+        candidate->service_quantum_bytes =
+            g_mac_aware_path_states[i].service_quantum_bytes;
+        candidate->observed_service_bytes =
+            g_mac_aware_path_states[i].observed_service_bytes;
+        candidate->mac_rtt_us = g_mac_aware_path_states[i].mac_rtt_us;
+        candidate->gap_us = g_mac_aware_path_states[i].gap_us;
+        candidate->last_selected_at_us =
+            g_mac_aware_path_states[i].last_selected_at_us;
     }
     pthread_mutex_unlock(&g_mac_aware_path_states_lock);
 
-    candidate->recovery_probe_due =
-        (candidate->risk_state == XQC_MAC_AWARE_RISK_STATE_RECOVERY
-            || candidate->rtt_stale)
-        && (candidate->last_probe_at_us == 0
-            || now - candidate->last_probe_at_us
-                >= config->min_probe_interval_us);
-}
-
-static uint64_t
-xqc_mac_aware_effective_inflight_budget(xqc_path_ctx_t *path,
-    const xqc_mac_aware_config_t *config)
-{
-    uint64_t budget;
-    uint64_t cwnd_budget = 0;
-    uint64_t cwnd;
-
-    if (config == NULL) {
-        return 0;
+    if (candidate->has_snapshot) {
+        candidate->service_rate_bytes_per_us =
+            xqc_mac_aware_snapshot_service_rate(&candidate->snapshot);
     }
-
-    budget = config->risk_inflight_budget_bytes;
-    cwnd = xqc_mac_aware_path_cwnd(path);
-    if (cwnd > 0 && config->risk_inflight_budget_pct > 0) {
-        cwnd_budget = cwnd * config->risk_inflight_budget_pct / 100;
+    if (candidate->service_quantum_bytes == 0) {
+        candidate->service_quantum_bytes = config->min_burst_bytes;
     }
-
-    if (budget == 0) {
-        return cwnd_budget;
-    }
-    if (cwnd_budget > 0 && cwnd_budget < budget) {
-        return cwnd_budget;
-    }
-    return budget;
-}
-
-static xqc_bool_t
-xqc_mac_aware_reservoir_gate_allowed(xqc_mac_aware_candidate_t *risk,
-    size_t packet_size, const xqc_mac_aware_config_t *config,
-    const char **block_reason)
-{
-    if (risk == NULL || config == NULL) {
-        if (block_reason != NULL) {
-            *block_reason = "no_risky_candidate";
-        }
-        return XQC_FALSE;
-    }
-
-    if (!config->tail_reservoir_enable) {
-        return XQC_TRUE;
-    }
-
-    if (risk->cc_headroom_bytes < packet_size
-        || risk->cc_headroom_bytes < config->min_cc_headroom_bytes)
+    candidate->service_quantum_bytes =
+        xqc_mac_aware_max_u64(candidate->service_quantum_bytes,
+            config->min_burst_bytes);
+    if (candidate->service_quantum_bytes
+        > config->service_quantum_cap_bytes)
     {
-        if (block_reason != NULL) {
-            *block_reason = "cc_blocked";
-        }
-        return XQC_FALSE;
+        candidate->service_quantum_bytes =
+            config->service_quantum_cap_bytes;
     }
-
-    if (config->tail_budget_bytes > 0
-        && risk->tail_budget_used_bytes + packet_size
-            > config->tail_budget_bytes)
-    {
-        if (block_reason != NULL) {
-            *block_reason = "tail_budget";
-        }
-        return XQC_FALSE;
-    }
-
-    if (!risk->recovery_probe_due) {
-        if (risk->service_quantum_bytes == 0) {
-            if (block_reason != NULL) {
-                *block_reason = "no_service_quantum";
-            }
-            return XQC_FALSE;
-        }
-        if (risk->rq_high_bytes > 0
-            && risk->rq_bytes + packet_size > risk->rq_high_bytes)
-        {
-            if (block_reason != NULL) {
-                *block_reason = "reservoir_full";
-            }
-            return XQC_FALSE;
-        }
-    }
-
-    return XQC_TRUE;
 }
 
 static void
-xqc_mac_aware_note_risky_selection(void *conn_user_data,
-    xqc_mac_aware_candidate_t *risk, uint64_t now, size_t packet_size,
-    xqc_bool_t recovery_probe)
+xqc_mac_aware_candidate_compute_budget(xqc_mac_aware_candidate_t *candidate,
+    const xqc_mac_aware_config_t *config, size_t packet_size)
 {
-    int i;
+    uint64_t desired;
+    uint64_t q;
 
-    if (conn_user_data == NULL || risk == NULL || risk->path == NULL) {
+    if (candidate == NULL || config == NULL) {
         return;
     }
 
-    pthread_mutex_lock(&g_mac_aware_path_states_lock);
-    i = xqc_mac_aware_ensure_state_slot_locked(conn_user_data,
-        risk->path->path_id);
-    if (recovery_probe) {
-        g_mac_aware_path_states[i].last_probe_at_us = now;
-    }
-    g_mac_aware_path_states[i].tail_admitted_bytes += packet_size;
-    g_mac_aware_path_states[i].tail_budget_used_bytes += packet_size;
-    pthread_mutex_unlock(&g_mac_aware_path_states_lock);
-}
+    q = candidate->service_quantum_bytes > 0
+        ? candidate->service_quantum_bytes : config->min_burst_bytes;
 
-static void
-xqc_mac_aware_decay_debt_locked(xqc_mac_aware_path_state_t *state,
-    uint64_t now, double service_rate_bytes_per_us,
-    const xqc_mac_aware_config_t *config)
-{
-    uint64_t elapsed_us;
-    double decay_bytes;
-
-    if (state == NULL || config == NULL) {
-        return;
-    }
-    if (state->arrival_debt_updated_at_us == 0
-        || now < state->arrival_debt_updated_at_us)
-    {
-        state->arrival_debt_updated_at_us = now;
-        return;
-    }
-
-    elapsed_us = now - state->arrival_debt_updated_at_us;
-    state->arrival_debt_updated_at_us = now;
-    if (elapsed_us == 0 || service_rate_bytes_per_us <= 0.0) {
-        return;
-    }
-
-    decay_bytes = service_rate_bytes_per_us * (double) elapsed_us
-        * (double) config->debt_decay_gain_pct / 100.0;
-    if (decay_bytes >= state->arrival_debt_bytes) {
-        state->arrival_debt_bytes = 0.0;
+    if (candidate->sample_count < config->min_mac_samples) {
+        desired = config->bootstrap_burst_bytes;
     } else {
-        state->arrival_debt_bytes -= decay_bytes;
+        desired = (uint64_t) ((double) q * config->burst_k);
     }
+
+    desired = xqc_mac_aware_max_u64(desired, config->min_burst_bytes);
+    desired = xqc_mac_aware_min_u64(desired, config->max_burst_bytes);
+    if (candidate->cc_headroom_bytes != UINT64_MAX) {
+        desired = xqc_mac_aware_min_u64(desired,
+            candidate->cc_headroom_bytes);
+    }
+    if (desired < packet_size) {
+        desired = 0;
+    }
+
+    candidate->burst_budget_bytes = desired;
 }
 
-static xqc_bool_t
-xqc_mac_aware_arrival_admission_allowed(void *conn_user_data,
-    xqc_mac_aware_candidate_t *risk, uint64_t now, size_t packet_size,
-    double predicted_ofo_bytes, const xqc_mac_aware_config_t *config,
-    const char **block_reason, uint64_t *arrival_debt_bytes,
-    uint64_t *risk_inflight_debt_bytes, uint64_t *risk_inflight_budget_bytes)
+static void
+xqc_mac_aware_candidate_compute_eta(xqc_mac_aware_candidate_t *candidate,
+    const xqc_mac_aware_config_t *config)
 {
-    int i;
-    uint64_t inflight = 0;
-    uint64_t inflight_budget = 0;
-    double projected_debt;
-    xqc_bool_t allowed = XQC_FALSE;
+    uint64_t q;
+    uint64_t service_time_us;
 
-    if (block_reason != NULL) {
-        *block_reason = "no_estimate";
-    }
-    if (arrival_debt_bytes != NULL) {
-        *arrival_debt_bytes = 0;
-    }
-    if (risk_inflight_debt_bytes != NULL) {
-        *risk_inflight_debt_bytes = 0;
-    }
-    if (risk_inflight_budget_bytes != NULL) {
-        *risk_inflight_budget_bytes = 0;
+    if (candidate == NULL || config == NULL) {
+        return;
     }
 
-    if (conn_user_data == NULL || risk == NULL || risk->path == NULL
-        || risk->path->path_send_ctl == NULL || config == NULL)
-    {
-        return XQC_FALSE;
+    if (candidate->sample_count < config->min_mac_samples) {
+        candidate->queue_quanta = 1;
+        candidate->eta_us = candidate->srtt_us;
+        return;
     }
 
-    inflight = risk->path->path_send_ctl->ctl_bytes_in_flight;
-    inflight_budget = xqc_mac_aware_effective_inflight_budget(risk->path,
-        config);
-    if (risk_inflight_debt_bytes != NULL) {
-        *risk_inflight_debt_bytes = inflight;
-    }
-    if (risk_inflight_budget_bytes != NULL) {
-        *risk_inflight_budget_bytes = inflight_budget;
+    q = candidate->service_quantum_bytes > 0
+        ? candidate->service_quantum_bytes : config->min_burst_bytes;
+    service_time_us = candidate->mac_rtt_us > 0
+        ? candidate->mac_rtt_us : candidate->srtt_us;
+    if (config->use_gap_in_eta) {
+        service_time_us += candidate->gap_us;
     }
 
-    if (inflight_budget > 0 && inflight + packet_size > inflight_budget) {
-        if (block_reason != NULL) {
-            *block_reason = "inflight_budget";
-        }
-        return XQC_FALSE;
-    }
-
-    if (predicted_ofo_bytes > (double) config->ofo_budget_bytes) {
-        if (block_reason != NULL) {
-            *block_reason = "ofo_budget";
-        }
-        return XQC_FALSE;
-    }
-
-    pthread_mutex_lock(&g_mac_aware_path_states_lock);
-    i = xqc_mac_aware_ensure_state_slot_locked(conn_user_data,
-        risk->path->path_id);
-    xqc_mac_aware_decay_debt_locked(&g_mac_aware_path_states[i], now,
-        risk->service_rate_bytes_per_us, config);
-
-    projected_debt = g_mac_aware_path_states[i].arrival_debt_bytes;
-    if (predicted_ofo_bytes > projected_debt) {
-        projected_debt = predicted_ofo_bytes;
-    }
-    projected_debt += (double) packet_size;
-
-    if (projected_debt <= (double) config->ofo_budget_bytes) {
-        g_mac_aware_path_states[i].arrival_debt_bytes = projected_debt;
-        g_mac_aware_path_states[i].arrival_debt_updated_at_us = now;
-        allowed = XQC_TRUE;
-        if (block_reason != NULL) {
-            *block_reason = "none";
-        }
-    } else if (block_reason != NULL) {
-        *block_reason = "arrival_debt";
-    }
-
-    if (arrival_debt_bytes != NULL) {
-        *arrival_debt_bytes =
-            (uint64_t) g_mac_aware_path_states[i].arrival_debt_bytes;
-    }
-    pthread_mutex_unlock(&g_mac_aware_path_states_lock);
-
-    return allowed;
+    candidate->queue_quanta =
+        xqc_mac_aware_ceil_div_u64(candidate->backlog_bytes, q);
+    candidate->eta_us = candidate->queue_quanta * service_time_us
+        + candidate->srtt_us / 2;
 }
 
 static xqc_bool_t
-xqc_mac_aware_clean_better(const xqc_mac_aware_candidate_t *candidate,
+xqc_mac_aware_cold_better(const xqc_mac_aware_candidate_t *candidate,
     const xqc_mac_aware_candidate_t *best)
 {
     if (candidate == NULL || candidate->path == NULL) {
@@ -952,63 +689,878 @@ xqc_mac_aware_clean_better(const xqc_mac_aware_candidate_t *candidate,
     if (best == NULL || best->path == NULL) {
         return XQC_TRUE;
     }
-    if (candidate->srtt_us != best->srtt_us) {
-        return candidate->srtt_us < best->srtt_us;
+    if (candidate->sample_count != best->sample_count) {
+        return candidate->sample_count < best->sample_count;
     }
-    if (candidate->mac_rtt_us > 0 && best->mac_rtt_us > 0
-        && candidate->mac_rtt_us != best->mac_rtt_us)
-    {
-        return candidate->mac_rtt_us < best->mac_rtt_us;
+    if (candidate->backlog_bytes != best->backlog_bytes) {
+        return candidate->backlog_bytes < best->backlog_bytes;
     }
-    return candidate->service_bytes > best->service_bytes;
-}
-
-static xqc_bool_t
-xqc_mac_aware_risk_better(const xqc_mac_aware_candidate_t *candidate,
-    const xqc_mac_aware_candidate_t *best)
-{
-    if (candidate == NULL || candidate->path == NULL) {
-        return XQC_FALSE;
-    }
-    if (best == NULL || best->path == NULL) {
-        return XQC_TRUE;
-    }
-    if (candidate->service_bytes > 0 && best->service_bytes > 0
-        && candidate->service_bytes != best->service_bytes)
-    {
-        return candidate->service_bytes > best->service_bytes;
-    }
-    if (candidate->cc_headroom_bytes != best->cc_headroom_bytes) {
-        return candidate->cc_headroom_bytes > best->cc_headroom_bytes;
-    }
-    if (candidate->mac_rtt_us > 0 && best->mac_rtt_us > 0
-        && candidate->mac_rtt_us != best->mac_rtt_us)
-    {
-        return candidate->mac_rtt_us < best->mac_rtt_us;
-    }
-    if (candidate->tail_p95_us != best->tail_p95_us) {
-        return candidate->tail_p95_us < best->tail_p95_us;
+    if (candidate->last_selected_at_us != best->last_selected_at_us) {
+        return candidate->last_selected_at_us < best->last_selected_at_us;
     }
     return candidate->srtt_us < best->srtt_us;
 }
 
-static uint64_t
-xqc_mac_aware_max_u64(uint64_t a, uint64_t b)
+static xqc_bool_t
+xqc_mac_aware_starved_better(const xqc_mac_aware_candidate_t *candidate,
+    const xqc_mac_aware_candidate_t *best)
 {
-    return a > b ? a : b;
+    uint64_t lhs;
+    uint64_t rhs;
+
+    if (candidate == NULL || candidate->path == NULL) {
+        return XQC_FALSE;
+    }
+    if (best == NULL || best->path == NULL) {
+        return XQC_TRUE;
+    }
+
+    lhs = candidate->backlog_bytes * best->service_quantum_bytes;
+    rhs = best->backlog_bytes * candidate->service_quantum_bytes;
+    if (lhs != rhs) {
+        return lhs < rhs;
+    }
+    if (candidate->eta_us != best->eta_us) {
+        return candidate->eta_us < best->eta_us;
+    }
+    if (candidate->last_selected_at_us != best->last_selected_at_us) {
+        return candidate->last_selected_at_us < best->last_selected_at_us;
+    }
+    return candidate->srtt_us < best->srtt_us;
+}
+
+static xqc_bool_t
+xqc_mac_aware_eta_better(const xqc_mac_aware_candidate_t *candidate,
+    const xqc_mac_aware_candidate_t *best)
+{
+    if (candidate == NULL || candidate->path == NULL) {
+        return XQC_FALSE;
+    }
+    if (best == NULL || best->path == NULL) {
+        return XQC_TRUE;
+    }
+    if (candidate->eta_us != best->eta_us) {
+        return candidate->eta_us < best->eta_us;
+    }
+    if (candidate->backlog_bytes != best->backlog_bytes) {
+        return candidate->backlog_bytes < best->backlog_bytes;
+    }
+    if (candidate->service_quantum_bytes != best->service_quantum_bytes) {
+        return candidate->service_quantum_bytes
+            > best->service_quantum_bytes;
+    }
+    if (candidate->last_selected_at_us != best->last_selected_at_us) {
+        return candidate->last_selected_at_us < best->last_selected_at_us;
+    }
+    return candidate->srtt_us < best->srtt_us;
+}
+
+static void
+xqc_mac_aware_note_selection(void *conn_user_data, uint64_t path_id,
+    uint64_t now)
+{
+    int i;
+
+    if (conn_user_data == NULL) {
+        return;
+    }
+
+    pthread_mutex_lock(&g_mac_aware_path_states_lock);
+    i = xqc_mac_aware_ensure_state_slot_locked(conn_user_data, path_id);
+    g_mac_aware_path_states[i].last_selected_at_us = now;
+    pthread_mutex_unlock(&g_mac_aware_path_states_lock);
+}
+
+xqc_bool_t
+xqc_mac_aware_stream_generation_enabled(xqc_connection_t *conn)
+{
+    if (conn == NULL || conn->scheduler_callback == NULL) {
+        return XQC_FALSE;
+    }
+    return conn->scheduler_callback->xqc_scheduler_get_path
+           == xqc_mac_aware_scheduler_get_path;
+}
+
+static uint64_t
+xqc_mac_aware_unscheduled_intent_bytes_on_list(xqc_list_head_t *head,
+    uint64_t path_id)
+{
+    xqc_list_head_t *pos, *next;
+    xqc_packet_out_t *packet_out;
+    uint64_t bytes = 0;
+
+    if (head == NULL) {
+        return 0;
+    }
+
+    xqc_list_for_each_safe(pos, next, head) {
+        packet_out = xqc_list_entry(pos, xqc_packet_out_t, po_list);
+        if (!packet_out->po_path_intent
+            || packet_out->po_path_intent_id != path_id
+            || !XQC_IS_ACK_ELICITING(packet_out->po_frame_types))
+        {
+            continue;
+        }
+        bytes += packet_out->po_cc_size > 0
+            ? packet_out->po_cc_size : packet_out->po_used_size;
+    }
+
+    return bytes;
+}
+
+static uint64_t
+xqc_mac_aware_unscheduled_intent_bytes(xqc_connection_t *conn,
+    uint64_t path_id)
+{
+    uint64_t bytes = 0;
+
+    if (conn == NULL || conn->conn_send_queue == NULL) {
+        return 0;
+    }
+
+    bytes += xqc_mac_aware_unscheduled_intent_bytes_on_list(
+        &conn->conn_send_queue->sndq_send_packets, path_id);
+    bytes += xqc_mac_aware_unscheduled_intent_bytes_on_list(
+        &conn->conn_send_queue->sndq_send_packets_high_pri, path_id);
+
+    return bytes;
+}
+
+static void
+xqc_mac_aware_stream_budget_trace_candidate(xqc_connection_t *conn,
+    xqc_path_ctx_t *path, const xqc_mac_aware_candidate_t *candidate,
+    const char *reason, uint64_t pending_bytes, uint64_t budget_bytes,
+    uint64_t packet_size, uint8_t cc_allowed)
+{
+    xqc_transport_trace_observation_t trace;
+    uint64_t path_schedule_bytes = 0;
+    const char *trace_reason = reason;
+
+    if (!xqc_transport_trace_enabled()) {
+        return;
+    }
+
+    if (candidate != NULL && reason != NULL
+        && (!candidate->has_snapshot || candidate->sample_count == 0))
+    {
+        if (strcmp(reason, "candidate_ok") == 0) {
+            trace_reason = "candidate_ok_cold";
+
+        } else if (strcmp(reason, "selected") == 0) {
+            trace_reason = "selected_cold";
+        }
+    }
+
+    xqc_transport_trace_observation_init(&trace, "stream_budget_candidate",
+                                         trace_reason);
+    if (path != NULL && path->path_send_ctl != NULL) {
+        xqc_transport_trace_fill_send_ctl(&trace, path->path_send_ctl);
+    } else {
+        xqc_transport_trace_fill_conn(&trace, conn);
+        if (path != NULL) {
+            trace.has_path = 1;
+            trace.path_id = path->path_id;
+        }
+    }
+
+    if (path != NULL) {
+        path_schedule_bytes = path->path_schedule_bytes;
+        trace.has_path = 1;
+        trace.path_id = path->path_id;
+    }
+
+    trace.stream_bytes = budget_bytes;
+    trace.packet_size = packet_size;
+    trace.po_cc_size = budget_bytes;
+    trace.schedule_bytes = pending_bytes;
+    trace.path_schedule_bytes_before = path_schedule_bytes;
+    trace.path_schedule_bytes_after = candidate != NULL
+        ? candidate->backlog_bytes : path_schedule_bytes;
+    trace.cwnd_allowed = cc_allowed ? 1 : 0;
+    trace.pacing_allowed = path != NULL
+        && path->path_state == XQC_PATH_STATE_ACTIVE ? 1 : 0;
+    trace.cc_allowed = cc_allowed ? 1 : 0;
+
+    xqc_transport_trace_notify(&trace);
+}
+
+xqc_path_ctx_t *
+xqc_mac_aware_stream_budget_get_path(void *scheduler, xqc_connection_t *conn,
+    size_t payload_left, uint64_t *budget_bytes)
+{
+    xqc_list_head_t *pos, *next;
+    xqc_path_ctx_t *path;
+    xqc_mac_aware_candidate_t candidates[XQC_MAC_AWARE_MAX_CANDIDATES];
+    xqc_mac_aware_candidate_t *selected;
+    const xqc_mac_aware_config_t *config = xqc_mac_aware_get_config();
+    uint8_t candidate_count = 0;
+    uint64_t now;
+    uint64_t packet_size;
+    uint64_t pending_bytes;
+    uint64_t selected_budget;
+    const char *decision_reason = "stream_no_path";
+
+    if (budget_bytes != NULL) {
+        *budget_bytes = 0;
+    }
+    (void) scheduler;
+    if (!xqc_mac_aware_stream_generation_enabled(conn)
+        || config == NULL || payload_left == 0)
+    {
+        return NULL;
+    }
+
+    packet_size = payload_left > XQC_PACKET_OUT_SIZE
+        ? XQC_PACKET_OUT_SIZE : (uint64_t) payload_left;
+    if (packet_size == 0) {
+        packet_size = 1;
+    }
+
+    now = xqc_monotonic_timestamp();
+    memset(candidates, 0, sizeof(candidates));
+
+    xqc_list_for_each_safe(pos, next, &conn->conn_paths_list) {
+        xqc_mac_aware_candidate_t candidate;
+        uint64_t cc_headroom_before_pending;
+
+        memset(&candidate, 0, sizeof(candidate));
+        path = xqc_list_entry(pos, xqc_path_ctx_t, path_list);
+        if (!xqc_scheduler_path_is_usable(path)) {
+            xqc_mac_aware_stream_budget_trace_candidate(conn, path, NULL,
+                path != NULL && path->path_state != XQC_PATH_STATE_ACTIVE
+                ? "path_not_established" : "not_usable",
+                0, 0, packet_size, 0);
+            continue;
+        }
+
+        candidate.path = path;
+        candidate.path_class = xqc_path_get_perf_class(path);
+        xqc_mac_aware_candidate_update_transport(&candidate, now, XQC_TRUE);
+        cc_headroom_before_pending = candidate.cc_headroom_bytes;
+        pending_bytes = xqc_mac_aware_unscheduled_intent_bytes(conn,
+            path->path_id);
+        candidate.pending_intent_bytes = pending_bytes;
+        candidate.backlog_bytes += pending_bytes;
+        if (candidate.cc_headroom_bytes != UINT64_MAX) {
+            if (candidate.cc_headroom_bytes > pending_bytes) {
+                candidate.cc_headroom_bytes -= pending_bytes;
+            } else {
+                candidate.cc_headroom_bytes = 0;
+            }
+        }
+        if (pending_bytes > 0
+            && cc_headroom_before_pending != UINT64_MAX
+            && cc_headroom_before_pending <= pending_bytes)
+        {
+            xqc_mac_aware_stream_budget_trace_candidate(conn, path,
+                &candidate, "pending_intent_over_budget", pending_bytes,
+                0, packet_size, 0);
+            continue;
+        }
+        if (candidate.cc_headroom_bytes != UINT64_MAX
+            && candidate.cc_headroom_bytes == 0)
+        {
+            xqc_mac_aware_stream_budget_trace_candidate(conn, path,
+                &candidate, "cc_headroom_zero", pending_bytes, 0,
+                packet_size, 0);
+            continue;
+        }
+        xqc_mac_aware_candidate_load_state(conn->user_data, &candidate, now,
+            config);
+        xqc_mac_aware_candidate_compute_eta(&candidate, config);
+        xqc_mac_aware_candidate_compute_budget(&candidate, config,
+            (size_t) packet_size);
+
+        if (candidate.burst_budget_bytes == 0) {
+            xqc_mac_aware_stream_budget_trace_candidate(conn, path,
+                &candidate, "budget_zero", pending_bytes, 0, packet_size,
+                0);
+            continue;
+        }
+        if (candidate_count < XQC_MAC_AWARE_MAX_CANDIDATES) {
+            xqc_mac_aware_stream_budget_trace_candidate(conn, path,
+                &candidate, "candidate_ok", pending_bytes,
+                candidate.burst_budget_bytes, packet_size, 1);
+            candidates[candidate_count++] = candidate;
+        }
+    }
+
+    if (candidate_count == 0) {
+        if (xqc_transport_trace_enabled()) {
+            xqc_transport_trace_observation_t trace;
+
+            xqc_transport_trace_observation_init(&trace,
+                "stream_budget_none", "no_candidate");
+            xqc_transport_trace_fill_conn(&trace, conn);
+            trace.stream_bytes = payload_left;
+            trace.packet_size = packet_size;
+            xqc_transport_trace_notify(&trace);
+        }
+        return NULL;
+    }
+
+    selected = xqc_mac_aware_select_candidate(candidates, candidate_count,
+        config, &decision_reason);
+
+    if (selected == NULL || selected->path == NULL
+        || selected->burst_budget_bytes == 0)
+    {
+        if (xqc_transport_trace_enabled()) {
+            xqc_transport_trace_observation_t trace;
+
+            xqc_transport_trace_observation_init(&trace,
+                "stream_budget_none", "no_selected_budget");
+            xqc_transport_trace_fill_conn(&trace, conn);
+            trace.stream_bytes = payload_left;
+            trace.packet_size = packet_size;
+            xqc_transport_trace_notify(&trace);
+        }
+        return NULL;
+    }
+
+    selected_budget = selected->burst_budget_bytes;
+    if (selected_budget < packet_size) {
+        selected_budget = packet_size;
+    }
+    if (selected_budget > payload_left) {
+        selected_budget = (uint64_t) payload_left;
+    }
+    if (selected_budget == 0) {
+        if (xqc_transport_trace_enabled()) {
+            xqc_transport_trace_observation_t trace;
+
+            xqc_transport_trace_observation_init(&trace,
+                "stream_budget_none", "zero_selected_budget");
+            xqc_transport_trace_fill_conn(&trace, conn);
+            trace.has_path = 1;
+            trace.path_id = selected->path->path_id;
+            trace.stream_bytes = payload_left;
+            trace.packet_size = packet_size;
+            xqc_transport_trace_notify(&trace);
+        }
+        return NULL;
+    }
+
+    if (budget_bytes != NULL) {
+        *budget_bytes = selected_budget;
+    }
+    xqc_mac_aware_note_selection(conn->user_data, selected->path->path_id,
+        now);
+    xqc_mac_aware_stream_budget_trace_candidate(conn, selected->path,
+        selected, "selected", selected->pending_intent_bytes,
+        selected_budget, packet_size, 1);
+    xqc_log(conn->log, XQC_LOG_DEBUG,
+            "|mac_aware_stream_budget|decision:%s|path:%ui|budget:%ui|"
+            "q:%ui|eta_us:%ui|backlog:%ui|headroom:%ui|",
+            decision_reason,
+            selected->path->path_id,
+            selected_budget,
+            selected->service_quantum_bytes,
+            selected->eta_us,
+            selected->backlog_bytes,
+            selected->cc_headroom_bytes == UINT64_MAX
+            ? 0 : selected->cc_headroom_bytes);
+    return selected->path;
+}
+
+xqc_path_ctx_t *
+xqc_mac_aware_path_intent_get_path(void *scheduler, xqc_connection_t *conn,
+    xqc_packet_out_t *packet_out, int check_cwnd, xqc_bool_t *cc_blocked,
+    xqc_bool_t *handled)
+{
+    xqc_path_ctx_t *path;
+    xqc_bool_t path_can_send;
+
+    (void) scheduler;
+
+    if (handled != NULL) {
+        *handled = XQC_FALSE;
+    }
+    if (conn == NULL || packet_out == NULL || !packet_out->po_path_intent
+        || !xqc_mac_aware_stream_generation_enabled(conn))
+    {
+        return NULL;
+    }
+
+    path = xqc_conn_find_path_by_path_id(conn,
+        packet_out->po_path_intent_id);
+    if (path == NULL || !xqc_scheduler_path_is_usable(path)) {
+        packet_out->po_path_intent = 0;
+        return NULL;
+    }
+
+    if (cc_blocked != NULL) {
+        *cc_blocked = XQC_TRUE;
+    }
+    path_can_send = xqc_scheduler_check_path_can_send(path, packet_out,
+        check_cwnd);
+    if (!path_can_send) {
+        return NULL;
+    }
+
+    if (cc_blocked != NULL) {
+        *cc_blocked = XQC_FALSE;
+    }
+    if (handled != NULL) {
+        *handled = XQC_TRUE;
+    }
+    xqc_mac_aware_note_selection(conn->user_data, path->path_id,
+        xqc_monotonic_timestamp());
+    return path;
+}
+
+static xqc_bool_t
+xqc_mac_aware_packet_stream_range(xqc_packet_out_t *packet_out,
+    uint64_t *stream_id, uint64_t *start_offset, uint64_t *end_offset,
+    uint64_t *payload_bytes)
+{
+    uint64_t id = 0;
+    uint64_t start = 0;
+    uint64_t end = 0;
+    uint64_t bytes = 0;
+    unsigned int i;
+    uint8_t have = 0;
+
+    if (packet_out == NULL
+        || !(packet_out->po_frame_types & XQC_FRAME_BIT_STREAM))
+    {
+        return XQC_FALSE;
+    }
+    if (packet_out->po_origin != NULL
+        || (packet_out->po_flag & (XQC_POF_REINJECTED_ORIGIN
+                                   | XQC_POF_REINJECTED_REPLICA
+                                   | XQC_POF_REINJECT_DIFF_PATH
+                                   | XQC_POF_TLP
+                                   | XQC_POF_LOST
+                                   | XQC_POF_PMTUD_PROBING)))
+    {
+        return XQC_FALSE;
+    }
+
+    for (i = 0; i < XQC_MAX_STREAM_FRAME_IN_PO; i++) {
+        xqc_po_stream_frame_t *frame = &packet_out->po_stream_frames[i];
+
+        if (!frame->ps_is_used) {
+            continue;
+        }
+        if (frame->ps_is_reset || frame->ps_length == 0) {
+            return XQC_FALSE;
+        }
+        if (!have) {
+            id = frame->ps_stream_id;
+            start = frame->ps_offset;
+            end = frame->ps_offset + frame->ps_length;
+            bytes = frame->ps_length;
+            have = 1;
+            continue;
+        }
+        if (frame->ps_stream_id != id || frame->ps_offset != end) {
+            return XQC_FALSE;
+        }
+        end = frame->ps_offset + frame->ps_length;
+        bytes += frame->ps_length;
+    }
+
+    if (!have || end <= start || bytes == 0) {
+        return XQC_FALSE;
+    }
+
+    if (stream_id != NULL) {
+        *stream_id = id;
+    }
+    if (start_offset != NULL) {
+        *start_offset = start;
+    }
+    if (end_offset != NULL) {
+        *end_offset = end;
+    }
+    if (payload_bytes != NULL) {
+        *payload_bytes = bytes;
+    }
+    return XQC_TRUE;
+}
+
+static xqc_mac_aware_offset_owner_t *
+xqc_mac_aware_find_offset_owner(xqc_mac_aware_scheduler_t *ctx,
+    uint64_t stream_id, uint64_t start_offset)
+{
+    uint8_t i;
+
+    if (ctx == NULL) {
+        return NULL;
+    }
+
+    for (i = 0; i < XQC_MAC_AWARE_OFFSET_OWNER_SLOTS; i++) {
+        if (ctx->offset_owners[i].used
+            && ctx->offset_owners[i].stream_id == stream_id
+            && ctx->offset_owners[i].next_offset == start_offset
+            && ctx->offset_owners[i].remaining_bytes > 0)
+        {
+            return &ctx->offset_owners[i];
+        }
+    }
+
+    return NULL;
+}
+
+static xqc_mac_aware_offset_owner_t *
+xqc_mac_aware_alloc_offset_owner(xqc_mac_aware_scheduler_t *ctx,
+    uint64_t stream_id)
+{
+    uint8_t i;
+
+    if (ctx == NULL) {
+        return NULL;
+    }
+
+    for (i = 0; i < XQC_MAC_AWARE_OFFSET_OWNER_SLOTS; i++) {
+        if (!ctx->offset_owners[i].used) {
+            return &ctx->offset_owners[i];
+        }
+    }
+
+    for (i = 0; i < XQC_MAC_AWARE_OFFSET_OWNER_SLOTS; i++) {
+        if (ctx->offset_owners[i].stream_id == stream_id) {
+            return &ctx->offset_owners[i];
+        }
+    }
+
+    return &ctx->offset_owners[0];
+}
+
+static void
+xqc_mac_aware_update_offset_owner(xqc_mac_aware_offset_owner_t *owner,
+    uint64_t stream_id, uint64_t path_id, uint64_t end_offset,
+    uint64_t payload_bytes, uint64_t chunk_bytes)
+{
+    uint64_t remaining = 0;
+
+    if (owner == NULL) {
+        return;
+    }
+
+    if (chunk_bytes > payload_bytes) {
+        remaining = chunk_bytes - payload_bytes;
+    }
+
+    owner->used = remaining > 0 ? 1 : 0;
+    owner->stream_id = stream_id;
+    owner->path_id = path_id;
+    owner->next_offset = end_offset;
+    owner->remaining_bytes = remaining;
+}
+
+static uint64_t
+xqc_mac_aware_offset_chunk_bytes(const xqc_mac_aware_candidate_t *candidate,
+    const xqc_mac_aware_config_t *config, uint64_t packet_bytes)
+{
+    uint64_t chunk;
+
+    if (config == NULL) {
+        return packet_bytes;
+    }
+
+    chunk = config->offset_chunk_bytes;
+    if (candidate != NULL && candidate->burst_budget_bytes > chunk) {
+        chunk = candidate->burst_budget_bytes;
+    }
+    if (chunk > config->offset_max_chunk_bytes) {
+        chunk = config->offset_max_chunk_bytes;
+    }
+    if (chunk < packet_bytes) {
+        chunk = packet_bytes;
+    }
+    return chunk;
+}
+
+static void
+xqc_mac_aware_offset_observation_init(xqc_scheduler_observation_t *observation,
+    xqc_connection_t *conn, xqc_packet_out_t *packet_out, uint64_t now)
+{
+    if (observation == NULL || conn == NULL || packet_out == NULL) {
+        return;
+    }
+
+    xqc_scheduler_observation_init(observation, "mac_aware", conn,
+        conn->user_data, packet_out->po_pkt.pkt_num, packet_out->po_used_size);
+    observation->ts_us = now;
+    observation->risk_reason = "none";
+}
+
+static void
+xqc_mac_aware_offset_observe_path(xqc_scheduler_observation_t *observation,
+    const xqc_mac_aware_candidate_t *candidate, xqc_bool_t path_can_send)
+{
+    if (observation == NULL || candidate == NULL || candidate->path == NULL) {
+        return;
+    }
+
+    xqc_scheduler_observe_path(observation, candidate->path, path_can_send,
+        candidate->path_class);
+}
+
+static void
+xqc_mac_aware_offset_observation_selected(
+    xqc_scheduler_observation_t *observation,
+    const xqc_mac_aware_candidate_t *selected,
+    const xqc_mac_aware_candidate_t *alt, const xqc_mac_aware_config_t *config,
+    const char *decision_reason, uint64_t owner_remaining_bytes,
+    uint64_t chunk_bytes)
+{
+    if (observation == NULL || selected == NULL || selected->path == NULL
+        || config == NULL)
+    {
+        return;
+    }
+
+    observation->has_selected_path = 1;
+    observation->selected_path_id = selected->path->path_id;
+    observation->decision_reason = decision_reason;
+    observation->selected_srtt_us = selected->srtt_us;
+    observation->selected_latest_rtt_us = selected->latest_rtt_us;
+    observation->selected_rtt_age_us = selected->ack_age_us;
+    observation->selected_service_bytes = selected->service_quantum_bytes;
+    observation->selected_service_rate_bytes_per_us =
+        selected->service_rate_bytes_per_us;
+    observation->ofo_budget_bytes = config->ofo_budget_bytes;
+    observation->admission_allowed = 1;
+    observation->service_admission_selected =
+        strcmp(decision_reason, "offset_continue") == 0 ? 0 : 1;
+    observation->admission_block_reason = "none";
+    observation->arrival_debt_bytes = owner_remaining_bytes;
+    observation->risk_inflight_debt_bytes = selected->inflight_bytes;
+    observation->risk_inflight_budget_bytes =
+        selected->cc_headroom_bytes == UINT64_MAX
+        ? 0 : selected->cc_headroom_bytes;
+    observation->risky_cwnd_bytes = selected->cwnd_bytes;
+    observation->risky_inflight_bytes = selected->inflight_bytes;
+    observation->risky_cc_headroom_bytes =
+        selected->cc_headroom_bytes == UINT64_MAX
+        ? 0 : selected->cc_headroom_bytes;
+    observation->risky_latest_rtt_us = selected->latest_rtt_us;
+    observation->risky_rtt_age_us = selected->ack_age_us;
+    observation->risky_reservoir_bytes = selected->backlog_bytes;
+    observation->risky_reservoir_low_bytes =
+        (uint64_t) ((double) selected->service_quantum_bytes
+            * config->rq_low_factor);
+    observation->risky_reservoir_high_bytes =
+        (uint64_t) ((double) selected->service_quantum_bytes
+            * config->rq_high_factor);
+    observation->risky_service_quantum_bytes =
+        selected->service_quantum_bytes;
+    observation->risky_service_bytes = selected->observed_service_bytes;
+    observation->risky_service_rate_bytes_per_us =
+        selected->service_rate_bytes_per_us;
+    observation->eta_clean_us = selected->eta_us;
+    observation->has_base_candidate = 1;
+    observation->base_candidate_path_id = selected->path->path_id;
+    observation->predicted_ofo_bytes = (double) chunk_bytes;
+    if (alt != NULL && alt->path != NULL) {
+        observation->has_admission_candidate = 1;
+        observation->admission_candidate_path_id = alt->path->path_id;
+        observation->eta_risky_us = alt->eta_us;
+        observation->arrival_skew_us =
+            selected->eta_us > alt->eta_us
+            ? selected->eta_us - alt->eta_us
+            : alt->eta_us - selected->eta_us;
+    }
+}
+
+xqc_path_ctx_t *
+xqc_mac_aware_offset_owner_get_path(void *scheduler, xqc_connection_t *conn,
+    xqc_packet_out_t *packet_out, int check_cwnd, xqc_bool_t *cc_blocked,
+    xqc_bool_t *handled)
+{
+    xqc_mac_aware_scheduler_t *ctx = scheduler;
+    xqc_mac_aware_offset_owner_t *owner;
+    xqc_path_ctx_t *owned_path;
+    xqc_path_ctx_t *path;
+    xqc_list_head_t *pos, *next;
+    xqc_scheduler_observation_t observation;
+    xqc_mac_aware_candidate_t candidates[XQC_MAC_AWARE_MAX_CANDIDATES];
+    xqc_mac_aware_candidate_t owned_candidate;
+    xqc_mac_aware_candidate_t *selected = NULL;
+    xqc_mac_aware_candidate_t *alt = NULL;
+    xqc_bool_t reached_cwnd_check = XQC_FALSE;
+    xqc_bool_t observation_ready = XQC_FALSE;
+    uint8_t candidate_count = 0;
+    uint64_t now;
+    uint64_t stream_id = 0;
+    uint64_t start_offset = 0;
+    uint64_t end_offset = 0;
+    uint64_t payload_bytes = 0;
+    uint64_t chunk_bytes;
+    const char *decision_reason = "offset_new";
+    const char *block_reason = "no_sendable_path";
+    const xqc_mac_aware_config_t *config = xqc_mac_aware_get_config();
+
+    if (handled != NULL) {
+        *handled = XQC_FALSE;
+    }
+    if (cc_blocked != NULL) {
+        *cc_blocked = XQC_FALSE;
+    }
+    if (ctx == NULL || conn == NULL || packet_out == NULL || config == NULL
+        || !config->offset_owner_enabled)
+    {
+        return NULL;
+    }
+    if (!xqc_mac_aware_packet_stream_range(packet_out, &stream_id,
+            &start_offset, &end_offset, &payload_bytes))
+    {
+        return NULL;
+    }
+    if (handled != NULL) {
+        *handled = XQC_TRUE;
+    }
+
+    now = xqc_monotonic_timestamp();
+    memset(&observation, 0, sizeof(observation));
+    xqc_mac_aware_offset_observation_init(&observation, conn, packet_out, now);
+    observation_ready = XQC_TRUE;
+    owner = xqc_mac_aware_find_offset_owner(ctx, stream_id, start_offset);
+    if (owner != NULL) {
+        owned_path = xqc_conn_find_path_by_path_id(conn, owner->path_id);
+        memset(&owned_candidate, 0, sizeof(owned_candidate));
+        if (owned_path != NULL) {
+            owned_candidate.path = owned_path;
+            owned_candidate.path_class = xqc_path_get_perf_class(owned_path);
+            xqc_mac_aware_candidate_update_transport(&owned_candidate, now,
+                check_cwnd);
+            xqc_mac_aware_candidate_load_state(conn->user_data,
+                &owned_candidate, now, config);
+            xqc_mac_aware_candidate_compute_eta(&owned_candidate, config);
+            xqc_mac_aware_candidate_compute_budget(&owned_candidate, config,
+                packet_out->po_used_size);
+        }
+        if (owned_path != NULL
+            && xqc_scheduler_path_is_usable(owned_path))
+        {
+            xqc_bool_t path_can_send = xqc_scheduler_check_path_can_send(
+                owned_path, packet_out, check_cwnd);
+            xqc_mac_aware_offset_observe_path(&observation,
+                &owned_candidate, path_can_send);
+            if (path_can_send) {
+                chunk_bytes = owner->remaining_bytes > payload_bytes
+                    ? owner->remaining_bytes : payload_bytes;
+                xqc_mac_aware_update_offset_owner(owner, stream_id,
+                    owned_path->path_id, end_offset, payload_bytes,
+                    chunk_bytes);
+                xqc_mac_aware_note_selection(conn->user_data,
+                    owned_path->path_id, now);
+                xqc_mac_aware_offset_observation_selected(&observation,
+                    &owned_candidate, NULL, config, "offset_continue",
+                    owner->remaining_bytes, chunk_bytes);
+                xqc_scheduler_notify_observer(&observation);
+                xqc_log(conn->log, XQC_LOG_DEBUG,
+                        "|mac_aware_offset_owner|decision:continue|path:%ui|"
+                        "stream:%ui|range:%ui-%ui|remaining:%ui|",
+                        owned_path->path_id, stream_id, start_offset,
+                        end_offset, owner->remaining_bytes);
+                return owned_path;
+            }
+        }
+        owner->used = 0;
+    }
+
+    memset(candidates, 0, sizeof(candidates));
+    xqc_list_for_each_safe(pos, next, &conn->conn_paths_list) {
+        xqc_mac_aware_candidate_t candidate;
+        xqc_bool_t path_can_send;
+
+        memset(&candidate, 0, sizeof(candidate));
+        path = xqc_list_entry(pos, xqc_path_ctx_t, path_list);
+        candidate.path = path;
+        candidate.path_class = xqc_path_get_perf_class(path);
+        xqc_mac_aware_candidate_update_transport(&candidate, now, check_cwnd);
+        xqc_mac_aware_candidate_load_state(conn->user_data, &candidate, now,
+            config);
+        xqc_mac_aware_candidate_compute_eta(&candidate, config);
+        xqc_mac_aware_candidate_compute_budget(&candidate, config,
+            packet_out->po_used_size);
+
+        if (!xqc_scheduler_path_is_usable(path)) {
+            xqc_mac_aware_offset_observe_path(&observation, &candidate,
+                XQC_FALSE);
+            continue;
+        }
+        if (!reached_cwnd_check) {
+            reached_cwnd_check = XQC_TRUE;
+            if (cc_blocked != NULL) {
+                *cc_blocked = XQC_TRUE;
+            }
+        }
+        path_can_send = xqc_scheduler_check_path_can_send(path, packet_out,
+            check_cwnd);
+        xqc_mac_aware_offset_observe_path(&observation, &candidate,
+            path_can_send);
+        if (!path_can_send) {
+            continue;
+        }
+        if (cc_blocked != NULL) {
+            *cc_blocked = XQC_FALSE;
+        }
+        if (candidate_count < XQC_MAC_AWARE_MAX_CANDIDATES) {
+            candidates[candidate_count++] = candidate;
+        }
+    }
+
+    selected = xqc_mac_aware_select_candidate(candidates, candidate_count,
+        config, &decision_reason);
+    if (selected != NULL && selected->path != NULL) {
+        owner = xqc_mac_aware_alloc_offset_owner(ctx, stream_id);
+        chunk_bytes = xqc_mac_aware_offset_chunk_bytes(selected, config,
+            payload_bytes);
+        xqc_mac_aware_update_offset_owner(owner, stream_id,
+            selected->path->path_id, end_offset, payload_bytes, chunk_bytes);
+        xqc_mac_aware_note_selection(conn->user_data,
+            selected->path->path_id, now);
+        alt = xqc_mac_aware_alt_candidate(candidates, candidate_count,
+            selected);
+        xqc_mac_aware_offset_observation_selected(&observation, selected, alt,
+            config, decision_reason, owner != NULL
+            ? owner->remaining_bytes : 0, chunk_bytes);
+        xqc_scheduler_notify_observer(&observation);
+        xqc_log(conn->log, XQC_LOG_DEBUG,
+                "|mac_aware_offset_owner|decision:%s|path:%ui|"
+                "stream:%ui|range:%ui-%ui|chunk:%ui|remaining:%ui|",
+                decision_reason, selected->path->path_id, stream_id,
+                start_offset, end_offset, chunk_bytes,
+                owner != NULL ? owner->remaining_bytes : 0);
+        return selected->path;
+    }
+
+    if (cc_blocked != NULL && !reached_cwnd_check) {
+        *cc_blocked = XQC_FALSE;
+    }
+    if (candidate_count > 0) {
+        block_reason = "offset_candidate_blocked";
+    }
+    if (observation_ready) {
+        observation.decision_reason = "offset_no_path";
+        observation.admission_block_reason = block_reason;
+        xqc_scheduler_notify_observer(&observation);
+    }
+    xqc_log(conn->log, XQC_LOG_DEBUG,
+            "|mac_aware_offset_owner_no_path|conn:%p|stream:%ui|"
+            "offset:%ui|reason:%s|",
+            conn, stream_id, start_offset, block_reason);
+    return NULL;
 }
 
 static size_t
 xqc_mac_aware_scheduler_size(void)
 {
-    return 0;
+    return sizeof(xqc_mac_aware_scheduler_t);
 }
 
 static void
 xqc_mac_aware_scheduler_init(void *scheduler, xqc_log_t *log,
     xqc_scheduler_params_t *param)
 {
-    return;
+    if (scheduler != NULL) {
+        memset(scheduler, 0, sizeof(xqc_mac_aware_scheduler_t));
+    }
 }
 
 static void
@@ -1029,25 +1581,103 @@ xqc_mac_aware_observation_set_can_send(xqc_scheduler_observation_t *observation,
     }
 }
 
-static void
-xqc_mac_aware_observation_set_path_risk(xqc_scheduler_observation_t *observation,
-    uint64_t path_id, xqc_bool_t high_risk, const char *risk_reason)
+static int
+xqc_mac_aware_find_candidate(xqc_mac_aware_candidate_t *candidates,
+    uint8_t candidate_count, uint64_t path_id)
 {
     uint8_t i;
 
-    if (observation == NULL) {
-        return;
-    }
-
-    for (i = 0; i < observation->path_count; i++) {
-        if (observation->paths[i].path_id == path_id) {
-            observation->paths[i].scheduler_high_risk =
-                high_risk ? 1 : 0;
-            observation->paths[i].scheduler_risk_reason =
-                risk_reason != NULL ? risk_reason : "none";
-            return;
+    for (i = 0; i < candidate_count; i++) {
+        if (candidates[i].path != NULL
+            && candidates[i].path->path_id == path_id)
+        {
+            return i;
         }
     }
+
+    return -1;
+}
+
+static xqc_mac_aware_candidate_t *
+xqc_mac_aware_select_candidate(xqc_mac_aware_candidate_t *candidates,
+    uint8_t candidate_count, const xqc_mac_aware_config_t *config,
+    const char **decision_reason)
+{
+    uint8_t i;
+    xqc_mac_aware_candidate_t *cold = NULL;
+    xqc_mac_aware_candidate_t *starved = NULL;
+    xqc_mac_aware_candidate_t *eta = NULL;
+
+    for (i = 0; i < candidate_count; i++) {
+        xqc_mac_aware_candidate_t *candidate = &candidates[i];
+
+        if (candidate->path == NULL || candidate->burst_budget_bytes == 0) {
+            continue;
+        }
+
+        if (candidate->sample_count < config->min_mac_samples) {
+            if (xqc_mac_aware_cold_better(candidate, cold)) {
+                cold = candidate;
+            }
+            continue;
+        }
+
+        if (candidate->backlog_bytes < candidate->service_quantum_bytes) {
+            if (xqc_mac_aware_starved_better(candidate, starved)) {
+                starved = candidate;
+            }
+            continue;
+        }
+
+        if (xqc_mac_aware_eta_better(candidate, eta)) {
+            eta = candidate;
+        }
+    }
+
+    if (cold != NULL) {
+        *decision_reason = "bootstrap";
+        return cold;
+    }
+    if (starved != NULL) {
+        *decision_reason = "anti_starvation";
+        return starved;
+    }
+    if (eta != NULL) {
+        *decision_reason = "eta";
+        return eta;
+    }
+
+    *decision_reason = "fallback";
+    for (i = 0; i < candidate_count; i++) {
+        if (candidates[i].path != NULL
+            && xqc_mac_aware_eta_better(&candidates[i], eta))
+        {
+            eta = &candidates[i];
+        }
+    }
+    return eta;
+}
+
+static xqc_mac_aware_candidate_t *
+xqc_mac_aware_alt_candidate(xqc_mac_aware_candidate_t *candidates,
+    uint8_t candidate_count, const xqc_mac_aware_candidate_t *selected)
+{
+    uint8_t i;
+    xqc_mac_aware_candidate_t *best = NULL;
+
+    for (i = 0; i < candidate_count; i++) {
+        if (&candidates[i] == selected) {
+            continue;
+        }
+        if (candidates[i].path == NULL) {
+            continue;
+        }
+        if (xqc_mac_aware_eta_better(&candidates[i], best)) {
+            best = &candidates[i];
+        }
+    }
+
+    return best;
 }
 
 xqc_path_ctx_t *
@@ -1055,42 +1685,25 @@ xqc_mac_aware_scheduler_get_path(void *scheduler,
     xqc_connection_t *conn, xqc_packet_out_t *packet_out, int check_cwnd,
     int reinject, xqc_bool_t *cc_blocked)
 {
+    xqc_mac_aware_scheduler_t *ctx = scheduler;
     xqc_scheduler_observation_t observation;
     xqc_list_head_t *pos, *next;
     xqc_path_ctx_t *path;
-    xqc_path_ctx_t *original_path = NULL;
-    xqc_mac_aware_candidate_t clean;
-    xqc_mac_aware_candidate_t risk;
-    xqc_mac_aware_candidate_t risk_cc_blocked;
-    xqc_mac_aware_candidate_t probe;
+    xqc_mac_aware_candidate_t candidates[XQC_MAC_AWARE_MAX_CANDIDATES];
     xqc_mac_aware_candidate_t original;
-    xqc_mac_aware_candidate_t selected;
+    xqc_mac_aware_candidate_t *selected = NULL;
+    xqc_mac_aware_candidate_t *alt = NULL;
     xqc_bool_t reached_cwnd_check = XQC_FALSE;
-    xqc_bool_t selected_risky = XQC_FALSE;
-    xqc_bool_t selected_admission = XQC_FALSE;
-    xqc_bool_t selected_recovery_probe = XQC_FALSE;
-    xqc_bool_t selected_reservoir_admit = XQC_FALSE;
+    uint8_t candidate_count = 0;
     uint64_t now;
-    uint64_t eta_clean_us = 0;
-    uint64_t eta_risky_us = 0;
-    uint64_t arrival_skew_us = 0;
-    double predicted_ofo_bytes = 0.0;
-    uint64_t arrival_debt_bytes = 0;
-    uint64_t risk_inflight_debt_bytes = 0;
-    uint64_t risk_inflight_budget_bytes = 0;
-    const char *admission_block_reason = "no_estimate";
-    const char *decision_reason = "normal";
-    uint8_t selected_risk_reason_bits = 0;
+    const char *decision_reason = "no_path";
+    const char *block_reason = "no_sendable_path";
     const xqc_mac_aware_config_t *config = xqc_mac_aware_get_config();
 
-    memset(&clean, 0, sizeof(clean));
-    memset(&risk, 0, sizeof(risk));
-    memset(&risk_cc_blocked, 0, sizeof(risk_cc_blocked));
-    memset(&probe, 0, sizeof(probe));
+    memset(candidates, 0, sizeof(candidates));
     memset(&original, 0, sizeof(original));
-    memset(&selected, 0, sizeof(selected));
 
-    if (cc_blocked) {
+    if (cc_blocked != NULL) {
         *cc_blocked = XQC_FALSE;
     }
 
@@ -1101,64 +1714,21 @@ xqc_mac_aware_scheduler_get_path(void *scheduler,
 
     xqc_list_for_each_safe(pos, next, &conn->conn_paths_list) {
         xqc_mac_aware_candidate_t candidate;
-        xqc_bool_t path_can_send = XQC_FALSE;
-        xqc_bool_t high_risk = XQC_FALSE;
-        uint8_t risk_reason_bits = 0;
+        xqc_bool_t path_can_send;
 
         memset(&candidate, 0, sizeof(candidate));
         path = xqc_list_entry(pos, xqc_path_ctx_t, path_list);
         candidate.path = path;
         candidate.path_class = xqc_path_get_perf_class(path);
-        candidate.srtt_us = xqc_send_ctl_get_srtt(path->path_send_ctl);
-        xqc_mac_aware_candidate_update_transport(&candidate, now, config);
-        candidate.has_snapshot =
-            xqc_mac_aware_scheduler_get_path_state(conn->user_data,
-                path->path_id, now, &candidate.snapshot, &high_risk,
-                &risk_reason_bits);
-        if (candidate.has_snapshot) {
-            candidate.instant_risk_reason_bits =
-                xqc_mac_aware_snapshot_risk_bits(&candidate.snapshot,
-                    config);
-            candidate.mac_rtt_us =
-                (uint64_t) candidate.snapshot.ewma_mac_rtt_us;
-            candidate.tail_p95_us = candidate.snapshot.tail_p95_us;
-            candidate.service_bytes =
-                xqc_mac_aware_snapshot_service_bytes(&candidate.snapshot);
-            candidate.service_rate_bytes_per_us =
-                xqc_mac_aware_snapshot_service_rate(&candidate.snapshot);
-            candidate.risk_reason_bits = risk_reason_bits;
-            candidate.service_quantum_bytes =
-                xqc_mac_aware_service_quantum_bytes(&candidate.snapshot,
-                    config);
-            candidate.rq_bytes = path->path_send_ctl != NULL
-                ? path->path_send_ctl->ctl_bytes_in_flight : 0;
-            candidate.rq_low_bytes = (uint64_t)
-                ((double) candidate.service_quantum_bytes
-                    * config->rq_low_factor);
-            candidate.rq_high_bytes = (uint64_t)
-                ((double) candidate.service_quantum_bytes
-                    * config->rq_high_factor);
-            if (candidate.rq_high_bytes < candidate.rq_low_bytes) {
-                candidate.rq_high_bytes = candidate.rq_low_bytes;
-            }
-            if (!high_risk) {
-                candidate.risk_state = XQC_MAC_AWARE_RISK_STATE_CLEAN;
-            } else if (candidate.instant_risk_reason_bits == 0) {
-                candidate.risk_state = XQC_MAC_AWARE_RISK_STATE_RECOVERY;
-            } else if (candidate.service_quantum_bytes > 0) {
-                candidate.risk_state = XQC_MAC_AWARE_RISK_STATE_WARM;
-            } else {
-                candidate.risk_state = XQC_MAC_AWARE_RISK_STATE_COLD;
-            }
-            xqc_mac_aware_candidate_load_scheduler_state(conn->user_data,
-                &candidate, now, config);
-        }
+        xqc_mac_aware_candidate_update_transport(&candidate, now, check_cwnd);
+        xqc_mac_aware_candidate_load_state(conn->user_data, &candidate, now,
+            config);
+        xqc_mac_aware_candidate_compute_eta(&candidate, config);
+        xqc_mac_aware_candidate_compute_budget(&candidate, config,
+            packet_out->po_used_size);
 
         xqc_scheduler_observe_path(&observation, path, 0,
             candidate.path_class);
-        xqc_mac_aware_observation_set_path_risk(&observation, path->path_id,
-            !reinject && candidate.has_snapshot && high_risk,
-            xqc_mac_aware_risk_reason_label(risk_reason_bits));
 
         if (!xqc_scheduler_path_is_usable(path)) {
             continue;
@@ -1166,7 +1736,7 @@ xqc_mac_aware_scheduler_get_path(void *scheduler,
 
         if (!reached_cwnd_check) {
             reached_cwnd_check = XQC_TRUE;
-            if (cc_blocked) {
+            if (cc_blocked != NULL) {
                 *cc_blocked = XQC_TRUE;
             }
         }
@@ -1176,225 +1746,159 @@ xqc_mac_aware_scheduler_get_path(void *scheduler,
         xqc_mac_aware_observation_set_can_send(&observation, path->path_id,
             path_can_send);
         if (!path_can_send) {
-            if (!reinject && candidate.has_snapshot && high_risk
-                && xqc_mac_aware_risk_better(&candidate, &risk_cc_blocked))
-            {
-                risk_cc_blocked = candidate;
-                risk_cc_blocked.risk_state =
-                    XQC_MAC_AWARE_RISK_STATE_CC_BLOCKED;
-            }
             continue;
         }
 
-        if (cc_blocked) {
+        if (cc_blocked != NULL) {
             *cc_blocked = XQC_FALSE;
         }
 
         if (reinject && packet_out->po_path_id == path->path_id) {
-            original_path = path;
             original = candidate;
             continue;
         }
 
-        if (!reinject && candidate.has_snapshot && high_risk) {
-            if (xqc_mac_aware_risk_better(&candidate, &risk)) {
-                risk = candidate;
-            }
-            if (xqc_mac_aware_risk_better(&candidate, &probe)) {
-                probe = candidate;
-            }
-            continue;
-        }
-
-        if (xqc_mac_aware_clean_better(&candidate, &clean)) {
-            clean = candidate;
+        if (candidate_count < XQC_MAC_AWARE_MAX_CANDIDATES) {
+            candidates[candidate_count++] = candidate;
         }
     }
 
-    if (clean.path != NULL) {
-        observation.has_base_candidate = 1;
-        observation.base_candidate_path_id = clean.path->path_id;
-    }
-    if (risk.path != NULL) {
-        observation.has_admission_candidate = 1;
-        observation.admission_candidate_path_id = risk.path->path_id;
-    } else if (risk_cc_blocked.path != NULL) {
-        observation.has_admission_candidate = 1;
-        observation.admission_candidate_path_id =
-            risk_cc_blocked.path->path_id;
-    }
-
-    if (!reinject && clean.path != NULL && risk.path != NULL) {
-        eta_clean_us = clean.srtt_us;
-        eta_risky_us = xqc_mac_aware_max_u64(risk.srtt_us, risk.mac_rtt_us);
-        if (!risk.rtt_stale && risk.latest_rtt_us > eta_risky_us) {
-            eta_risky_us = risk.latest_rtt_us;
-        }
-        if (risk.tail_p95_us > 0) {
-            eta_risky_us += risk.tail_p95_us;
-        }
-        arrival_skew_us = eta_risky_us > eta_clean_us
-            ? eta_risky_us - eta_clean_us : 0;
-
-        if (!xqc_mac_aware_reservoir_gate_allowed(&risk,
-                packet_out->po_used_size, config, &admission_block_reason))
-        {
-            /* block_reason is set by the reservoir gate. */
-
-        } else if (clean.service_rate_bytes_per_us > 0.0) {
-            predicted_ofo_bytes =
-                clean.service_rate_bytes_per_us * (double) arrival_skew_us;
-            if (xqc_mac_aware_arrival_admission_allowed(conn->user_data,
-                &risk, now, packet_out->po_used_size, predicted_ofo_bytes,
-                config, &admission_block_reason, &arrival_debt_bytes,
-                &risk_inflight_debt_bytes, &risk_inflight_budget_bytes))
-            {
-                selected = risk;
-                selected_risky = XQC_TRUE;
-                selected_admission = XQC_TRUE;
-                selected_recovery_probe = risk.recovery_probe_due
-                    ? XQC_TRUE : XQC_FALSE;
-                selected_reservoir_admit =
-                    config->tail_reservoir_enable ? XQC_TRUE : XQC_FALSE;
-                selected_risk_reason_bits = risk.risk_reason_bits;
-                if (selected_recovery_probe) {
-                    decision_reason = "recovery_probe";
-                } else if (config->tail_reservoir_enable) {
-                    decision_reason = "reservoir_admit";
-                } else {
-                    decision_reason = "arrival_admission";
-                }
-            }
+    if (ctx != NULL && ctx->burst_remaining_bytes > 0) {
+        int burst_idx = xqc_mac_aware_find_candidate(candidates,
+            candidate_count, ctx->burst_path_id);
+        if (burst_idx >= 0) {
+            selected = &candidates[burst_idx];
+            decision_reason = "burst_continue";
         } else {
-            admission_block_reason = "no_clean_service_rate";
+            ctx->burst_remaining_bytes = 0;
+            ctx->burst_path_id = 0;
         }
-    } else if (clean.path == NULL) {
-        admission_block_reason = "no_clean_candidate";
-    } else if (risk_cc_blocked.path != NULL) {
-        admission_block_reason = "cc_blocked";
-    } else {
-        admission_block_reason = "no_risky_candidate";
     }
 
-    if (selected.path == NULL && clean.path != NULL) {
-        selected = clean;
-        decision_reason = "clean";
+    if (selected == NULL) {
+        selected = xqc_mac_aware_select_candidate(candidates, candidate_count,
+            config, &decision_reason);
     }
 
-    if (!reinject && selected.path == NULL && probe.path != NULL) {
-        selected = probe;
-        selected_risky = XQC_TRUE;
-        selected_risk_reason_bits = probe.risk_reason_bits;
-        decision_reason = "risk_fallback";
-    }
-
-    if (selected.path == NULL && original_path != NULL
+    if (selected == NULL && original.path != NULL
         && !(packet_out->po_flag & XQC_POF_REINJECT_DIFF_PATH))
     {
-        selected = original;
+        selected = &original;
         decision_reason = "reinject_original";
     }
 
-    if (selected_admission && selected_risky) {
-        xqc_mac_aware_note_risky_selection(conn->user_data, &selected, now,
-            packet_out->po_used_size, selected_recovery_probe);
-    }
+    if (selected != NULL && selected->path != NULL) {
+        uint64_t packet_size = packet_out->po_used_size;
+        uint64_t remaining = 0;
 
-    observation.eta_clean_us = eta_clean_us;
-    observation.eta_risky_us = eta_risky_us;
-    observation.eta_delta_us = arrival_skew_us;
-    observation.arrival_skew_us = arrival_skew_us;
-    observation.predicted_ofo_bytes = predicted_ofo_bytes;
-    observation.selected_srtt_us = selected.srtt_us;
-    observation.selected_latest_rtt_us = selected.latest_rtt_us;
-    observation.selected_rtt_age_us = selected.ack_age_us;
-    observation.ofo_budget_bytes = config->ofo_budget_bytes;
-    observation.arrival_debt_bytes = arrival_debt_bytes;
-    observation.risk_inflight_debt_bytes = risk_inflight_debt_bytes;
-    observation.risk_inflight_budget_bytes = risk_inflight_budget_bytes;
-    observation.admission_allowed = selected_admission ? 1 : 0;
-    observation.service_admission_selected = selected_admission ? 1 : 0;
-    observation.reservoir_admit_selected = selected_reservoir_admit ? 1 : 0;
-    observation.recovery_probe_selected = selected_recovery_probe ? 1 : 0;
-    observation.admission_block_reason = admission_block_reason;
-    if (risk.path != NULL) {
-        observation.risky_service_bytes = risk.service_bytes;
-        observation.risky_service_rate_bytes_per_us =
-            risk.service_rate_bytes_per_us;
-        observation.risky_cwnd_bytes = risk.cwnd_bytes;
-        observation.risky_inflight_bytes = risk.inflight_bytes;
-        observation.risky_cc_headroom_bytes = risk.cc_headroom_bytes;
-        observation.risky_latest_rtt_us = risk.latest_rtt_us;
-        observation.risky_rtt_age_us = risk.ack_age_us;
-        observation.risky_rtt_stale = risk.rtt_stale;
-        observation.risky_reservoir_bytes = risk.rq_bytes;
-        observation.risky_reservoir_low_bytes = risk.rq_low_bytes;
-        observation.risky_reservoir_high_bytes = risk.rq_high_bytes;
-        observation.risky_service_quantum_bytes =
-            risk.service_quantum_bytes;
-        observation.risky_last_probe_at_us = risk.last_probe_at_us;
-        observation.risky_tail_budget_used_bytes =
-            risk.tail_budget_used_bytes;
+        if (ctx != NULL) {
+            if (strcmp(decision_reason, "burst_continue") == 0) {
+                if (ctx->burst_remaining_bytes > packet_size) {
+                    ctx->burst_remaining_bytes -= packet_size;
+                } else {
+                    ctx->burst_remaining_bytes = 0;
+                    ctx->burst_path_id = 0;
+                }
+            } else {
+                if (selected->burst_budget_bytes > packet_size) {
+                    remaining = selected->burst_budget_bytes - packet_size;
+                }
+                ctx->burst_path_id = selected->path->path_id;
+                ctx->burst_remaining_bytes = remaining;
+            }
+        }
 
-    } else if (risk_cc_blocked.path != NULL) {
-        observation.risky_service_bytes = risk_cc_blocked.service_bytes;
-        observation.risky_service_rate_bytes_per_us =
-            risk_cc_blocked.service_rate_bytes_per_us;
-        observation.risky_cwnd_bytes = risk_cc_blocked.cwnd_bytes;
-        observation.risky_inflight_bytes = risk_cc_blocked.inflight_bytes;
-        observation.risky_cc_headroom_bytes =
-            risk_cc_blocked.cc_headroom_bytes;
-        observation.risky_latest_rtt_us = risk_cc_blocked.latest_rtt_us;
-        observation.risky_rtt_age_us = risk_cc_blocked.ack_age_us;
-        observation.risky_rtt_stale = risk_cc_blocked.rtt_stale;
-        observation.risky_reservoir_bytes = risk_cc_blocked.rq_bytes;
-        observation.risky_reservoir_low_bytes =
-            risk_cc_blocked.rq_low_bytes;
-        observation.risky_reservoir_high_bytes =
-            risk_cc_blocked.rq_high_bytes;
-        observation.risky_service_quantum_bytes =
-            risk_cc_blocked.service_quantum_bytes;
-        observation.risky_last_probe_at_us =
-            risk_cc_blocked.last_probe_at_us;
-        observation.risky_tail_budget_used_bytes =
-            risk_cc_blocked.tail_budget_used_bytes;
-    }
+        xqc_mac_aware_note_selection(conn->user_data, selected->path->path_id,
+            now);
+        alt = xqc_mac_aware_alt_candidate(candidates, candidate_count,
+            selected);
 
-    if (selected.path != NULL) {
         observation.has_selected_path = 1;
-        observation.selected_path_id = selected.path->path_id;
+        observation.selected_path_id = selected->path->path_id;
         observation.decision_reason = decision_reason;
-        observation.risk_reason =
-            xqc_mac_aware_risk_reason_label(selected_risk_reason_bits);
-        observation.selected_service_bytes = selected.service_bytes;
+        observation.risk_reason = "none";
+        observation.selected_srtt_us = selected->srtt_us;
+        observation.selected_latest_rtt_us = selected->latest_rtt_us;
+        observation.selected_rtt_age_us = selected->ack_age_us;
+        observation.selected_service_bytes =
+            selected->service_quantum_bytes;
         observation.selected_service_rate_bytes_per_us =
-            selected.service_rate_bytes_per_us;
+            selected->service_rate_bytes_per_us;
+        observation.ofo_budget_bytes = config->ofo_budget_bytes;
+        observation.admission_allowed = 1;
+        observation.service_admission_selected =
+            strcmp(decision_reason, "burst_continue") == 0 ? 0 : 1;
+        observation.admission_block_reason = "none";
+        observation.arrival_debt_bytes = ctx != NULL
+            ? ctx->burst_remaining_bytes : 0;
+        observation.risk_inflight_debt_bytes = selected->inflight_bytes;
+        observation.risk_inflight_budget_bytes =
+            selected->cc_headroom_bytes == UINT64_MAX
+            ? 0 : selected->cc_headroom_bytes;
+        observation.risky_cwnd_bytes = selected->cwnd_bytes;
+        observation.risky_inflight_bytes = selected->inflight_bytes;
+        observation.risky_cc_headroom_bytes =
+            selected->cc_headroom_bytes == UINT64_MAX
+            ? 0 : selected->cc_headroom_bytes;
+        observation.risky_latest_rtt_us = selected->latest_rtt_us;
+        observation.risky_rtt_age_us = selected->ack_age_us;
+        observation.risky_reservoir_bytes = selected->backlog_bytes;
+        observation.risky_reservoir_low_bytes =
+            (uint64_t) ((double) selected->service_quantum_bytes
+                * config->rq_low_factor);
+        observation.risky_reservoir_high_bytes =
+            (uint64_t) ((double) selected->service_quantum_bytes
+                * config->rq_high_factor);
+        observation.risky_service_quantum_bytes =
+            selected->service_quantum_bytes;
+        observation.risky_service_bytes =
+            selected->observed_service_bytes;
+        observation.risky_service_rate_bytes_per_us =
+            selected->service_rate_bytes_per_us;
+        observation.eta_clean_us = selected->eta_us;
+        observation.has_base_candidate = 1;
+        observation.base_candidate_path_id = selected->path->path_id;
+        if (alt != NULL) {
+            observation.has_admission_candidate = 1;
+            observation.admission_candidate_path_id = alt->path->path_id;
+            observation.eta_risky_us = alt->eta_us;
+            observation.arrival_skew_us =
+                selected->eta_us > alt->eta_us
+                ? selected->eta_us - alt->eta_us
+                : alt->eta_us - selected->eta_us;
+        }
+        observation.predicted_ofo_bytes =
+            (double) selected->burst_budget_bytes;
+
         xqc_scheduler_notify_observer(&observation);
 
         xqc_log(conn->log, XQC_LOG_DEBUG,
-                "|mac_aware_best_path:%ui|scheduler:%s|decision:%s|"
-                "risk:%d|service_bytes:%ui|service_rate_bytes_per_us:%.6f|"
-                "arrival_skew_us:%ui|predicted_ofo_bytes:%.3f|"
-                "ofo_budget:%ui|block_reason:%s|used_mask:%ui|",
-                selected.path->path_id, "mac_aware", decision_reason,
-                selected_risky, selected.service_bytes,
-                selected.service_rate_bytes_per_us, arrival_skew_us,
-                predicted_ofo_bytes, config->ofo_budget_bytes,
-                admission_block_reason,
+                "|mac_aware_clean_path:%ui|decision:%s|q:%ui|"
+                "backlog:%ui|eta_us:%ui|burst_budget:%ui|"
+                "burst_remaining:%ui|samples:%ui|used_mask:%ui|",
+                selected->path->path_id, decision_reason,
+                selected->service_quantum_bytes, selected->backlog_bytes,
+                selected->eta_us, selected->burst_budget_bytes,
+                ctx != NULL ? ctx->burst_remaining_bytes : 0,
+                selected->sample_count,
                 xqc_scheduler_packet_path_mask(conn, packet_out));
-        return selected.path;
+        return selected->path;
     }
 
-    if (cc_blocked && !reached_cwnd_check) {
+    if (cc_blocked != NULL && !reached_cwnd_check) {
         *cc_blocked = XQC_FALSE;
     }
 
+    if (candidate_count > 0) {
+        block_reason = "burst_budget_blocked";
+    }
     observation.decision_reason = "no_path";
     observation.risk_reason = "none";
+    observation.admission_block_reason = block_reason;
     xqc_scheduler_notify_observer(&observation);
     xqc_log(conn->log, XQC_LOG_DEBUG,
-            "|mac_aware_no_available_path|conn:%p|scheduler:%s|reinj:%d|",
-            conn, "mac_aware", reinject);
+            "|mac_aware_no_available_path|conn:%p|reinj:%d|reason:%s|",
+            conn, reinject, block_reason);
     return NULL;
 }
 

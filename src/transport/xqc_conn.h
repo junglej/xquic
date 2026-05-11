@@ -529,6 +529,7 @@ xqc_int_t xqc_conn_server_on_alpn(xqc_connection_t *conn, const unsigned char *a
 ssize_t xqc_path_send_one_packet(xqc_connection_t *conn, xqc_path_ctx_t *path, xqc_packet_out_t *packet_out);
 void xqc_conn_send_packets(xqc_connection_t *conn);
 void xqc_conn_send_packets_batch(xqc_connection_t *conn);
+void xqc_conn_schedule_normal_packets_to_paths(xqc_connection_t *conn);
 
 void xqc_conn_check_path_utilization(xqc_connection_t *conn);
 uint64_t xqc_conn_get_unscheduled_bytes(xqc_connection_t *conn);

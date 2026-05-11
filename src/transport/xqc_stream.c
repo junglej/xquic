@@ -15,6 +15,8 @@
 #include "src/transport/xqc_packet.h"
 #include "src/transport/xqc_utils.h"
 #include "src/transport/xqc_pacing.h"
+#include "src/transport/scheduler/xqc_scheduler_mac_aware.h"
+#include "src/transport/xqc_transport_trace.h"
 #include "src/tls/xqc_tls.h"
 #include "src/transport/xqc_fec.h"
 
@@ -1548,7 +1550,6 @@ xqc_stream_send(xqc_stream_t *stream, unsigned char *send_data, size_t send_data
     int buff_1rtt = 0;
     int check_app_limit = 1;
 
-
     if (!(conn->conn_flag & XQC_CONN_FLAG_CAN_SEND_1RTT)) {
         if ((conn->conn_type == XQC_CONN_TYPE_CLIENT) && support_0rtt
             && xqc_conn_is_ready_to_send_early_data(conn))
@@ -1592,11 +1593,52 @@ xqc_stream_send(xqc_stream_t *stream, unsigned char *send_data, size_t send_data
             check_app_limit = 0;
         }
 
-        ret = xqc_write_stream_frame_to_packet(conn, stream, pkt_type,
-                                               fin,
+        xqc_path_ctx_t *path_intent = NULL;
+        uint64_t path_budget = 0;
+        size_t payload_left = send_data_size - offset;
+        size_t payload_size = payload_left;
+        uint8_t write_fin = fin;
+
+        if (pkt_type == XQC_PTYPE_SHORT_HEADER
+            && payload_left > 0
+            && xqc_mac_aware_stream_generation_enabled(conn))
+        {
+            path_intent = xqc_mac_aware_stream_budget_get_path(
+                conn->scheduler, conn, payload_left, &path_budget);
+            if (path_intent == NULL || path_budget == 0) {
+                if (xqc_transport_trace_enabled()) {
+                    xqc_transport_trace_observation_t trace;
+
+                    xqc_transport_trace_observation_init(
+                        &trace, "stream_generate_blocked",
+                        path_intent == NULL ? "no_path_budget"
+                                            : "zero_path_budget");
+                    xqc_transport_trace_fill_conn(&trace, conn);
+                    trace.stream_id = stream->stream_id;
+                    trace.stream_bytes = payload_left;
+                    trace.packet_size = payload_left;
+                    trace.po_cc_size = path_budget;
+                    if (path_intent != NULL) {
+                        trace.has_path = 1;
+                        trace.path_id = path_intent->path_id;
+                    }
+                    xqc_transport_trace_notify(&trace);
+                }
+                ret = -XQC_EAGAIN;
+                goto do_buff;
+            }
+            if (path_budget < payload_size) {
+                payload_size = (size_t) path_budget;
+                write_fin = 0;
+            }
+        }
+
+        ret = xqc_write_stream_frame_to_packet_with_path_intent(conn, stream,
+                                               pkt_type, write_fin,
                                                send_data + offset,
-                                               send_data_size - offset,
-                                               &send_data_written);
+                                               payload_size,
+                                               &send_data_written,
+                                               path_intent);
         if (ret) {
             xqc_log(conn->log, XQC_LOG_ERROR, "|xqc_write_stream_frame_to_packet error|");
             XQC_CONN_ERR(conn, TRA_INTERNAL_ERROR);

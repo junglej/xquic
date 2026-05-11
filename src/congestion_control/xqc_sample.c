@@ -7,6 +7,7 @@
 #include "src/transport/xqc_send_ctl.h"
 #include "src/transport/xqc_packet_out.h"
 #include "src/transport/xqc_packet.h"
+#include "src/transport/xqc_transport_trace.h"
 
 
 void xqc_init_sample_before_ack(xqc_sample_t *sampler)
@@ -190,6 +191,14 @@ xqc_sample_check_app_limited(xqc_sample_t *sampler, xqc_send_ctl_t *send_ctl, xq
                 send_ctl->ctl_app_limited);
         if (send_ctl->ctl_app_limited > 0) {
             xqc_log_event(send_ctl->ctl_conn->log, REC_CONGESTION_STATE_UPDATED, "application_limit");
+        }
+        if (xqc_transport_trace_enabled()) {
+            xqc_transport_trace_observation_t trace;
+
+            xqc_transport_trace_observation_init(&trace, "app_limit_enter",
+                                                 "path_pipe_empty");
+            xqc_transport_trace_fill_send_ctl(&trace, send_ctl);
+            xqc_transport_trace_notify(&trace);
         }
         return XQC_TRUE;
     }

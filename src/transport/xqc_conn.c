@@ -31,6 +31,8 @@
 #include "src/transport/xqc_packet.h"
 #include "src/transport/xqc_fec.h"
 #include "src/transport/xqc_fec_scheme.h"
+#include "src/transport/scheduler/xqc_scheduler_mac_aware.h"
+#include "src/transport/xqc_transport_trace.h"
 #include "src/tls/xqc_tls.h"
 #include "src/tls/xqc_tls_common.h"
 #include <inttypes.h>
@@ -2017,6 +2019,7 @@ xqc_conn_schedule_packets(xqc_connection_t *conn,  xqc_list_head_t *head,
 
     xqc_list_for_each_safe(pos, next, head) {
         packet_out = xqc_list_entry(pos, xqc_packet_out_t, po_list);
+        cc_blocked = XQC_FALSE;
         /* 1. 已设置特定路径发送的包，例如：PATH_CHALLENGE PATH_RESPONSE MP_ACK(原路径ACK) */
         if (xqc_packet_out_on_specific_path(conn, packet_out, &path)) {
             if (path == NULL) {
@@ -2028,12 +2031,49 @@ xqc_conn_schedule_packets(xqc_connection_t *conn,  xqc_list_head_t *head,
 
         /* 2. schedule packet multipath */
         } else {
-            path = conn->scheduler_callback->
-                   xqc_scheduler_get_path(conn->scheduler, 
-                                          conn, packet_out, 
-                                          packets_are_limited_by_cc, 
-                                          0, &cc_blocked);
+            xqc_bool_t offset_owner_handled = XQC_FALSE;
+            xqc_bool_t path_intent_handled = XQC_FALSE;
+
+            path = NULL;
+            if ((send_type == XQC_SEND_TYPE_NORMAL
+                 || send_type == XQC_SEND_TYPE_NORMAL_HIGH_PRI)
+                && conn->scheduler_callback->xqc_scheduler_get_path
+                   == xqc_mac_aware_scheduler_get_path)
+            {
+                path = xqc_mac_aware_path_intent_get_path(conn->scheduler,
+                    conn, packet_out, packets_are_limited_by_cc,
+                    &cc_blocked, &path_intent_handled);
+            }
+            if (!path_intent_handled
+                && send_type == XQC_SEND_TYPE_NORMAL
+                && conn->scheduler_callback->xqc_scheduler_get_path
+                   == xqc_mac_aware_scheduler_get_path)
+            {
+                cc_blocked = XQC_FALSE;
+                path = xqc_mac_aware_offset_owner_get_path(conn->scheduler,
+                    conn, packet_out, packets_are_limited_by_cc, &cc_blocked,
+                    &offset_owner_handled);
+            }
+            if (!path_intent_handled && !offset_owner_handled) {
+                path = conn->scheduler_callback->
+                       xqc_scheduler_get_path(conn->scheduler,
+                                              conn, packet_out,
+                                              packets_are_limited_by_cc,
+                                              0, &cc_blocked);
+            }
             if (path == NULL) {
+                if (xqc_transport_trace_enabled()) {
+                    xqc_transport_trace_observation_t trace;
+
+                    xqc_transport_trace_observation_init(&trace,
+                        "schedule_no_path",
+                        cc_blocked ? "cc_blocked" : "scheduler_no_path");
+                    xqc_transport_trace_fill_conn(&trace, conn);
+                    xqc_transport_trace_fill_packet(&trace, packet_out);
+                    trace.send_type = send_type;
+                    trace.cc_allowed = cc_blocked ? 0 : 1;
+                    xqc_transport_trace_notify(&trace);
+                }
                 if (cc_blocked) {
                     conn->sched_cc_blocked++;
                     if (packet_out->po_sched_cwnd_blk_ts == 0) {
@@ -2770,6 +2810,19 @@ xqc_conn_schedule_end(xqc_connection_t *conn)
 }
 
 void
+xqc_conn_schedule_normal_packets_to_paths(xqc_connection_t *conn)
+{
+    xqc_list_head_t *head;
+
+    if (conn == NULL) {
+        return;
+    }
+
+    head = &conn->conn_send_queue->sndq_send_packets;
+    xqc_conn_schedule_packets(conn, head, XQC_TRUE, XQC_SEND_TYPE_NORMAL);
+}
+
+void
 xqc_conn_schedule_packets_to_paths(xqc_connection_t *conn)
 {
     xqc_conn_schedule_start(conn);
@@ -2792,8 +2845,7 @@ xqc_conn_schedule_packets_to_paths(xqc_connection_t *conn)
         xqc_conn_reinject_unack_packets(conn, XQC_REINJ_UNACK_BEFORE_SCHED);
     }
 
-    head = &conn->conn_send_queue->sndq_send_packets;
-    xqc_conn_schedule_packets(conn, head, XQC_TRUE, XQC_SEND_TYPE_NORMAL);
+    xqc_conn_schedule_normal_packets_to_paths(conn);
 
     /* all packets are scheduled, we need to check if there are paths not fully utilized */
     xqc_conn_check_path_utilization(conn);

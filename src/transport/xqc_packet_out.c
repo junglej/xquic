@@ -18,6 +18,7 @@
 #include "src/transport/xqc_reinjection.h"
 #include "src/transport/xqc_packet_out.h"
 #include "src/transport/xqc_cid.h"
+#include "src/transport/xqc_transport_trace.h"
 
 
 xqc_packet_out_t *
@@ -363,7 +364,8 @@ error:
 }
 
 xqc_packet_out_t *
-xqc_write_packet_for_stream(xqc_connection_t *conn, xqc_pkt_type_t pkt_type, unsigned need, xqc_stream_t *stream)
+xqc_write_packet_for_stream(xqc_connection_t *conn, xqc_pkt_type_t pkt_type,
+    unsigned need, xqc_stream_t *stream, xqc_path_ctx_t *path_intent)
 {
     int ret;
     xqc_packet_out_t *packet_out;
@@ -372,13 +374,18 @@ xqc_write_packet_for_stream(xqc_connection_t *conn, xqc_pkt_type_t pkt_type, uns
         pkt_type = xqc_state_to_pkt_type(conn);
     }
 
-    packet_out = xqc_send_queue_get_packet_out_for_stream(conn->conn_send_queue, need, pkt_type, stream);
+    packet_out = xqc_send_queue_get_packet_out_for_stream(
+        conn->conn_send_queue, need, pkt_type, stream, path_intent);
     if (packet_out == NULL) {
         xqc_log(conn->log, XQC_LOG_ERROR, "|xqc_send_queue_get_packet_out_for_stream error|");
         return NULL;
     }
 
     packet_out->po_path_id = XQC_INITIAL_PATH_ID;
+    if (path_intent != NULL) {
+        packet_out->po_path_intent = 1;
+        packet_out->po_path_intent_id = path_intent->path_id;
+    }
 
     if (packet_out->po_used_size == 0) {
         ret = xqc_write_packet_header(conn, packet_out);
@@ -1171,13 +1178,14 @@ xqc_fec_encode_queue_insert_send(xqc_packet_out_t *po, xqc_stream_t *stream)
 
 
 int
-xqc_write_stream_frame_to_packet(xqc_connection_t *conn,
+xqc_write_stream_frame_to_packet_with_path_intent(xqc_connection_t *conn,
     xqc_stream_t *stream, xqc_pkt_type_t pkt_type, uint8_t fin,
     const unsigned char *payload, size_t payload_size, 
-    size_t *send_data_written)
+    size_t *send_data_written, xqc_path_ctx_t *path_intent)
 {
     xqc_packet_out_t *packet_out;
     int n_written;
+    uint64_t frame_offset;
 
     /* increase recv window */
     xqc_usec_t max_srtt = 0;
@@ -1228,13 +1236,15 @@ xqc_write_stream_frame_to_packet(xqc_connection_t *conn,
     /* We need 25 bytes for stream frame header at most, and left bytes for stream data.
      * It's a trade-off value, bigger need bytes for higher payload rate. */
     const unsigned need = 50;
-    packet_out = xqc_write_packet_for_stream(conn, pkt_type, need, stream);
+    packet_out = xqc_write_packet_for_stream(conn, pkt_type, need, stream,
+                                             path_intent);
     if (packet_out == NULL) {
         return -XQC_EWRITE_PKT;
     }
 
+    frame_offset = stream->stream_send_offset;
     n_written = xqc_gen_stream_frame(packet_out,
-                                     stream->stream_id, stream->stream_send_offset, fin,
+                                     stream->stream_id, frame_offset, fin,
                                      payload,
                                      payload_size,
                                      send_data_written);
@@ -1247,6 +1257,26 @@ xqc_write_stream_frame_to_packet(xqc_connection_t *conn,
     packet_out->po_used_size += n_written;
     packet_out->po_stream_id = stream->stream_id;
     packet_out->po_stream_offset = stream->stream_send_offset;
+
+    if (xqc_transport_trace_enabled()) {
+        xqc_transport_trace_observation_t trace;
+
+        xqc_transport_trace_observation_init(&trace, "stream_generate",
+                                             path_intent != NULL
+                                             ? "stream_frame_intent"
+                                             : "stream_frame");
+        xqc_transport_trace_fill_conn(&trace, conn);
+        xqc_transport_trace_fill_packet(&trace, packet_out);
+        if (path_intent != NULL) {
+            trace.has_path = 1;
+            trace.path_id = path_intent->path_id;
+        }
+        trace.stream_id = stream->stream_id;
+        trace.stream_offset = frame_offset;
+        trace.stream_bytes = *send_data_written;
+        trace.packet_size = packet_out->po_used_size;
+        xqc_transport_trace_notify(&trace);
+    }
 
 #ifdef XQC_ENABLE_FEC
     // FEC process source packet on stream level
@@ -1278,6 +1308,16 @@ xqc_write_stream_frame_to_packet(xqc_connection_t *conn,
         stream->stream_stats.first_write_time = xqc_monotonic_timestamp();
     }
     return XQC_OK;
+}
+
+int
+xqc_write_stream_frame_to_packet(xqc_connection_t *conn,
+    xqc_stream_t *stream, xqc_pkt_type_t pkt_type, uint8_t fin,
+    const unsigned char *payload, size_t payload_size,
+    size_t *send_data_written)
+{
+    return xqc_write_stream_frame_to_packet_with_path_intent(conn, stream,
+        pkt_type, fin, payload, payload_size, send_data_written, NULL);
 }
 
 int 

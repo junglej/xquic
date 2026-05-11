@@ -21,6 +21,7 @@
 #include "src/transport/xqc_utils.h"
 #include "src/transport/xqc_datagram.h"
 #include "src/transport/xqc_reinjection.h"
+#include "src/transport/xqc_transport_trace.h"
 
 int 
 xqc_send_ctl_may_remove_unacked_dgram(xqc_connection_t *conn, xqc_packet_out_t *po)
@@ -451,6 +452,19 @@ xqc_send_packet_cwnd_allows(xqc_send_ctl_t *send_ctl,
         if (!xqc_send_ctl_can_send(send_ctl, packet_out, schedule_bytes)) {
             xqc_log(conn->log, XQC_LOG_DEBUG, 
                     "|blocked by congestion control|po_sz:%ud|", packet_out->po_used_size);
+            if (xqc_transport_trace_enabled()) {
+                xqc_transport_trace_observation_t trace;
+
+                xqc_transport_trace_observation_init(&trace, "send_block_cwnd",
+                                                     "cwnd");
+                xqc_transport_trace_fill_send_ctl(&trace, send_ctl);
+                xqc_transport_trace_fill_packet(&trace, packet_out);
+                trace.schedule_bytes = schedule_bytes;
+                trace.cwnd_allowed = 0;
+                trace.pacing_allowed = 1;
+                trace.cc_allowed = 0;
+                xqc_transport_trace_notify(&trace);
+            }
             if (packet_out->po_send_cwnd_blk_ts == 0) {
                 packet_out->po_send_cwnd_blk_ts = now;
             }
@@ -474,6 +488,19 @@ xqc_send_packet_pacer_allows(xqc_send_ctl_t *send_ctl,
                     schedule_bytes + packet_out->po_used_size)) 
             {
                 xqc_log(conn->log, XQC_LOG_DEBUG, "|pacing blocked|");
+                if (xqc_transport_trace_enabled()) {
+                    xqc_transport_trace_observation_t trace;
+
+                    xqc_transport_trace_observation_init(&trace,
+                        "send_block_pacing", "pacing");
+                    xqc_transport_trace_fill_send_ctl(&trace, send_ctl);
+                    xqc_transport_trace_fill_packet(&trace, packet_out);
+                    trace.schedule_bytes = schedule_bytes;
+                    trace.cwnd_allowed = 1;
+                    trace.pacing_allowed = 0;
+                    trace.cc_allowed = 0;
+                    xqc_transport_trace_notify(&trace);
+                }
                 if (packet_out->po_send_pacing_blk_ts == 0) {
                     packet_out->po_send_pacing_blk_ts = now;
                 }
@@ -700,6 +727,19 @@ xqc_send_ctl_on_packet_sent(xqc_send_ctl_t *send_ctl, xqc_pn_ctl_t *pn_ctl, xqc_
             xqc_conn_increase_unacked_stream_ref(send_ctl->ctl_conn, packet_out);
         }
 
+        if (xqc_transport_trace_enabled()) {
+            xqc_transport_trace_observation_t trace;
+
+            xqc_transport_trace_observation_init(&trace, "packet_sent",
+                                                 "sent");
+            xqc_transport_trace_fill_send_ctl(&trace, send_ctl);
+            xqc_transport_trace_fill_packet(&trace, packet_out);
+            trace.cwnd_allowed = 1;
+            trace.pacing_allowed = 1;
+            trace.cc_allowed = 1;
+            xqc_transport_trace_notify(&trace);
+        }
+
         if (XQC_IS_ACK_ELICITING(packet_out->po_frame_types)
             /* do not set loss detection timer for PMTUD probing */
             && !(packet_out->po_flag & XQC_POF_PMTUD_PROBING)) 
@@ -830,6 +870,8 @@ xqc_send_ctl_on_ack_received(xqc_send_ctl_t *send_ctl, xqc_pn_ctl_t *pn_ctl, xqc
     xqc_usec_t spurious_loss_sent_time = 0;
     unsigned char need_del_record = 0;
     int stream_frame_acked = 0;
+    uint8_t trace_sample_generated = 0;
+    xqc_sample_type_t trace_sample_type = XQC_RATE_SAMPLE_ACK_NOTHING;
 
     if (xqc_send_ctl_detect_optimistic_ack_attack(send_ctl, pn_ctl, ack_info, ack_recv_time) < 0) {
         XQC_CONN_ERR(conn, TRA_PROTOCOL_VIOLATION);
@@ -1006,6 +1048,16 @@ xqc_send_ctl_on_ack_received(xqc_send_ctl_t *send_ctl, xqc_pn_ctl_t *pn_ctl, xqc
     if (send_ctl->ctl_app_limited 
         && send_ctl->ctl_delivered > send_ctl->ctl_app_limited)
     {
+        if (xqc_transport_trace_enabled()) {
+            xqc_transport_trace_observation_t trace;
+
+            xqc_transport_trace_observation_init(&trace, "app_limit_exit",
+                                                 "delivered_past_marker");
+            xqc_transport_trace_fill_send_ctl(&trace, send_ctl);
+            trace.acked_bytes =
+                send_ctl->ctl_delivered - send_ctl->ctl_prior_delivered;
+            xqc_transport_trace_notify(&trace);
+        }
         send_ctl->ctl_app_limited = 0;
     }
 
@@ -1016,6 +1068,8 @@ xqc_send_ctl_on_ack_received(xqc_send_ctl_t *send_ctl, xqc_pn_ctl_t *pn_ctl, xqc
         int bw_record_flag = 0;
         xqc_usec_t now = ack_recv_time;
         xqc_sample_type_t sample_type = xqc_generate_sample(&send_ctl->sampler, send_ctl, ack_recv_time);
+        trace_sample_generated = 1;
+        trace_sample_type = sample_type;
 
         /* Make sure that we do not call BBR with a invalid sampler. */
         if (sample_type == XQC_RATE_SAMPLE_VALID) {
@@ -1081,10 +1135,29 @@ xqc_send_ctl_on_ack_received(xqc_send_ctl_t *send_ctl, xqc_pn_ctl_t *pn_ctl, xqc
 
     } else if (send_ctl->ctl_cong_callback->xqc_cong_ctl_on_ack_multiple_pkts) {
         xqc_sample_type_t sample_type = xqc_generate_sample(&send_ctl->sampler, send_ctl, ack_recv_time);
+        trace_sample_generated = 1;
+        trace_sample_type = sample_type;
         /* Currently, this is only the case for Copa. */
         if (sample_type != XQC_RATE_SAMPLE_ACK_NOTHING) {
             send_ctl->ctl_cong_callback->xqc_cong_ctl_on_ack_multiple_pkts(send_ctl->ctl_cong, &send_ctl->sampler);
         }
+    }
+
+    if (xqc_transport_trace_enabled()) {
+        xqc_transport_trace_observation_t trace;
+
+        xqc_transport_trace_observation_init(&trace, "ack_update", "ack");
+        xqc_transport_trace_fill_send_ctl(&trace, send_ctl);
+        trace.acked_bytes =
+            send_ctl->ctl_delivered - send_ctl->ctl_prior_delivered;
+        trace.sample_type = trace_sample_generated ? trace_sample_type : 255;
+        trace.sample_valid = trace_sample_generated
+                             && trace_sample_type == XQC_RATE_SAMPLE_VALID;
+        trace.rate_sample_bytes_per_s = send_ctl->sampler.delivery_rate;
+        if (trace_sample_generated) {
+            trace.app_limited = send_ctl->sampler.is_app_limited ? 1 : 0;
+        }
+        xqc_transport_trace_notify(&trace);
     }
 
     xqc_send_ctl_info_circle_record(send_ctl);

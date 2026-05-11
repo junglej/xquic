@@ -132,11 +132,12 @@ xqc_send_queue_get_packet_out(xqc_send_queue_t *send_queue, unsigned need, xqc_p
 
 xqc_packet_out_t *
 xqc_send_queue_get_packet_out_for_stream(xqc_send_queue_t *send_queue, unsigned need, xqc_pkt_type_t pkt_type,
-    xqc_stream_t *stream)
+    xqc_stream_t *stream, xqc_path_ctx_t *path_intent)
 {
     xqc_packet_out_t *packet_out;
     xqc_list_head_t  *pos;
     xqc_list_head_t  *list = &send_queue->sndq_send_packets;
+    xqc_bool_t        want_intent = path_intent != NULL;
     if (stream->stream_priority == XQC_STREAM_PRI_HIGH) {
         list = &send_queue->sndq_send_packets_high_pri;
     }
@@ -147,6 +148,9 @@ xqc_send_queue_get_packet_out_for_stream(xqc_send_queue_t *send_queue, unsigned 
             && xqc_get_po_remained_size(packet_out) >= need
             && packet_out->po_stream_frames_idx < XQC_MAX_STREAM_FRAME_IN_PO
             && packet_out->po_stream_frames_idx > 0
+            && packet_out->po_path_intent == want_intent
+            && (!want_intent
+                || packet_out->po_path_intent_id == path_intent->path_id)
             /* Avoid Head-of-Line blocking. */
             && packet_out->po_stream_frames[packet_out->po_stream_frames_idx - 1].ps_stream_id == stream->stream_id
             && !(packet_out->po_frame_types & XQC_FRAME_BIT_SID)
@@ -169,6 +173,11 @@ xqc_send_queue_get_packet_out_for_stream(xqc_send_queue_t *send_queue, unsigned 
 
     if (pkt_type == XQC_PTYPE_0RTT) {
         send_queue->sndq_conn->zero_rtt_count++;
+    }
+
+    if (path_intent != NULL) {
+        packet_out->po_path_intent = 1;
+        packet_out->po_path_intent_id = path_intent->path_id;
     }
 
     return packet_out;

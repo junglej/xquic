@@ -22,6 +22,7 @@
 #include "src/transport/scheduler/xqc_scheduler_mac_aware.h"
 #include "src/transport/scheduler/xqc_scheduler_observer.h"
 #include "src/transport/xqc_stream.h"
+#include "src/transport/xqc_transport_trace.h"
 #ifndef XQC_SYS_WINDOWS
 #include <unistd.h>
 #include <sys/socket.h>
@@ -77,6 +78,7 @@ printf_null(const char *format, ...)
 #define XQC_TEST_CLI_SCHED_TRACE_SUFFIX ".scheduler_trace.csv"
 #define XQC_TEST_CLI_REQ_TRACE_SUFFIX ".request_trace.csv"
 #define XQC_TEST_CLI_STREAM_TRACE_SUFFIX ".stream_trace.csv"
+#define XQC_TEST_CLI_TRANSPORT_TRACE_SUFFIX ".transport_trace.csv"
 
 typedef struct user_conn_s user_conn_t;
 
@@ -104,6 +106,7 @@ typedef struct client_ctx_s {
     int             scheduler_trace_fd;
     int             request_trace_fd;
     int             stream_trace_fd;
+    int             transport_trace_fd;
     struct event   *ev_delay;
     struct event_base *eb;
     struct event   *ev_conc;
@@ -114,6 +117,7 @@ typedef struct client_ctx_s {
     char            scheduler_trace_path[256];
     char            request_trace_path[256];
     char            stream_trace_path[256];
+    char            transport_trace_path[256];
     char            wifi_monitor_output_dir[256];
     char            wifi_monitor_config_path[256];
     xqc_wifi_monitor_t *wifi_monitor;
@@ -616,6 +620,8 @@ xqc_test_cli_open_aux_trace_files(client_ctx_t *c)
         c->wifi_state_path, sizeof(c->wifi_state_path));
     xqc_test_cli_build_aux_path(g_log_path, XQC_TEST_CLI_SCHED_TRACE_SUFFIX,
         c->scheduler_trace_path, sizeof(c->scheduler_trace_path));
+    xqc_test_cli_build_aux_path(g_log_path, XQC_TEST_CLI_TRANSPORT_TRACE_SUFFIX,
+        c->transport_trace_path, sizeof(c->transport_trace_path));
 
     c->path_map_fd = xqc_test_cli_open_aux_csv(c->path_map_path,
         "ts_us,conn,path_id,path_seq,ifname,ifindex,fd");
@@ -669,6 +675,16 @@ xqc_test_cli_open_aux_trace_files(client_ctx_t *c)
         "risky_last_probe_at_us,risky_tail_budget_used_bytes,"
         "selected_srtt_us,selected_latest_rtt_us,selected_rtt_age_us,"
         "reservoir_admit_selected,recovery_probe_selected");
+    c->transport_trace_fd = xqc_test_cli_open_aux_csv(c->transport_trace_path,
+        "ts_us,conn,event,reason,path_id,path_ifname,stream_id,"
+        "stream_offset,stream_bytes,packet_size,po_cc_size,packet_number,"
+        "pkt_type,frame_types,send_type,schedule_bytes,"
+        "path_schedule_bytes_before,path_schedule_bytes_after,cwnd_bytes,"
+        "bytes_in_flight,pacing_rate_bytes_per_s,pacing_budget_bytes,"
+        "pacing_on,cwnd_allowed,pacing_allowed,cc_allowed,app_limited,"
+        "sample_type,sample_valid,acked_bytes,delivered_bytes,lost_pkts,"
+        "srtt_us,latest_rtt_us,bandwidth_bytes_per_s,"
+        "rate_sample_bytes_per_s");
     if (g_transport == 1) {
         xqc_test_cli_build_aux_path(g_log_path, XQC_TEST_CLI_STREAM_TRACE_SUFFIX,
             c->stream_trace_path, sizeof(c->stream_trace_path));
@@ -692,6 +708,9 @@ xqc_test_cli_open_aux_trace_files(client_ctx_t *c)
     }
     if (c->scheduler_trace_fd > 0) {
         printf("scheduler trace: %s\n", c->scheduler_trace_path);
+    }
+    if (c->transport_trace_fd > 0) {
+        printf("transport trace: %s\n", c->transport_trace_path);
     }
     if (c->request_trace_fd > 0) {
         printf("request trace: %s\n", c->request_trace_path);
@@ -731,6 +750,10 @@ xqc_test_cli_close_aux_trace_files(client_ctx_t *c)
     if (c->stream_trace_fd > 0) {
         close(c->stream_trace_fd);
         c->stream_trace_fd = 0;
+    }
+    if (c->transport_trace_fd > 0) {
+        close(c->transport_trace_fd);
+        c->transport_trace_fd = 0;
     }
 }
 
@@ -1282,6 +1305,71 @@ xqc_test_cli_scheduler_observer_cb(const xqc_scheduler_observation_t *observatio
 }
 
 static void
+xqc_test_cli_transport_trace_observer_cb(
+    const xqc_transport_trace_observation_t *observation, void *user_data)
+{
+    char line[2048];
+    client_ctx_t *c = user_data;
+    xqc_user_path_t *path = NULL;
+    const char *ifname = "-";
+
+    if (c == NULL || observation == NULL || c->transport_trace_fd <= 0) {
+        return;
+    }
+
+    if (observation->has_path) {
+        path = xqc_test_cli_find_path_by_id(observation->path_id);
+        if (path != NULL && path->ifname[0] != '\0') {
+            ifname = path->ifname;
+        }
+    }
+
+    snprintf(line, sizeof(line),
+        "%"PRIu64",%p,%s,%s,%"PRIu64",%s,%"PRIu64",%"PRIu64","
+        "%"PRIu64",%"PRIu64",%"PRIu64",%"PRIu64",%u,%"PRIu64",%u,"
+        "%"PRIu64",%"PRIu64",%"PRIu64",%"PRIu64",%"PRIu64","
+        "%"PRIu64",%"PRIu64",%u,%u,%u,%u,%u,%u,%u,%"PRIu64","
+        "%"PRIu64",%"PRIu64",%"PRIu64",%"PRIu64",%"PRIu64",%"PRIu64,
+        observation->ts_us,
+        observation->conn_user_data,
+        observation->event ? observation->event : "-",
+        observation->reason ? observation->reason : "-",
+        observation->has_path ? observation->path_id : 0,
+        ifname,
+        observation->stream_id,
+        observation->stream_offset,
+        observation->stream_bytes,
+        observation->packet_size,
+        observation->po_cc_size,
+        observation->packet_number,
+        observation->pkt_type,
+        observation->frame_types,
+        observation->send_type,
+        observation->schedule_bytes,
+        observation->path_schedule_bytes_before,
+        observation->path_schedule_bytes_after,
+        observation->cwnd_bytes,
+        observation->bytes_in_flight,
+        observation->pacing_rate_bytes_per_s,
+        observation->pacing_budget_bytes,
+        (unsigned) observation->pacing_on,
+        (unsigned) observation->cwnd_allowed,
+        (unsigned) observation->pacing_allowed,
+        (unsigned) observation->cc_allowed,
+        (unsigned) observation->app_limited,
+        observation->sample_type,
+        (unsigned) observation->sample_valid,
+        observation->acked_bytes,
+        observation->delivered_bytes,
+        observation->lost_pkts,
+        observation->srtt_us,
+        observation->latest_rtt_us,
+        observation->bandwidth_bytes_per_s,
+        observation->rate_sample_bytes_per_s);
+    xqc_test_cli_write_aux_line(c->transport_trace_fd, line);
+}
+
+static void
 xqc_test_cli_resolve_monitor_paths(client_ctx_t *c)
 {
     const char *env_out_dir;
@@ -1331,6 +1419,8 @@ xqc_test_cli_init_monitoring(client_ctx_t *c)
     }
 
     xqc_scheduler_register_observer(xqc_test_cli_scheduler_observer_cb, c);
+    xqc_transport_trace_register_observer(
+        xqc_test_cli_transport_trace_observer_cb, c);
     xqc_test_cli_resolve_monitor_paths(c);
 
 #ifndef XQC_SYS_WINDOWS
@@ -1369,6 +1459,7 @@ xqc_test_cli_shutdown_monitoring(client_ctx_t *c)
     }
 
     xqc_scheduler_unregister_observer();
+    xqc_transport_trace_unregister_observer();
     if (c->wifi_monitor != NULL) {
         xqc_wifi_monitor_stop(c->wifi_monitor);
         c->wifi_monitor = NULL;

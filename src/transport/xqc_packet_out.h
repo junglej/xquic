@@ -107,6 +107,8 @@ typedef struct xqc_packet_out_s {
     /* Multipath */
     uint8_t                 po_path_flag;
     uint64_t                po_path_id;
+    uint8_t                 po_path_intent;
+    uint64_t                po_path_intent_id;
     unsigned int            po_cc_size; /* TODO: check cc size != send size */
 
     /* Reinjection */
@@ -156,7 +158,7 @@ xqc_packet_out_t *xqc_write_new_packet(xqc_connection_t *conn, xqc_pkt_type_t pk
 xqc_packet_out_t *xqc_write_packet(xqc_connection_t *conn, xqc_pkt_type_t pkt_type, unsigned need);
 
 xqc_packet_out_t *xqc_write_packet_for_stream(xqc_connection_t *conn, xqc_pkt_type_t pkt_type, unsigned need,
-    xqc_stream_t *stream);
+    xqc_stream_t *stream, xqc_path_ctx_t *path_intent);
 
 int xqc_write_packet_header(xqc_connection_t *conn, xqc_packet_out_t *packet_out);
 
@@ -193,6 +195,10 @@ int xqc_write_new_token_to_packet(xqc_connection_t *conn);
 
 int xqc_write_stream_frame_to_packet(xqc_connection_t *conn, xqc_stream_t *stream, xqc_pkt_type_t pkt_type,
     uint8_t fin, const unsigned char *payload, size_t payload_size, size_t *send_data_written);
+
+int xqc_write_stream_frame_to_packet_with_path_intent(xqc_connection_t *conn, xqc_stream_t *stream,
+    xqc_pkt_type_t pkt_type, uint8_t fin, const unsigned char *payload, size_t payload_size,
+    size_t *send_data_written, xqc_path_ctx_t *path_intent);
 
 int xqc_write_datagram_frame_to_packet(xqc_connection_t *conn, xqc_pkt_type_t pkt_type, 
     const unsigned char *data, size_t data_len, uint64_t *dgram_id, xqc_bool_t use_supplied_dgram_id,

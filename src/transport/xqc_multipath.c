@@ -14,6 +14,7 @@
 #include "src/transport/xqc_frame_parser.h"
 #include "src/transport/xqc_datagram.h"
 #include "src/transport/xqc_recv_timestamps_info.h"
+#include "src/transport/xqc_transport_trace.h"
 
 #include "src/common/xqc_common.h"
 #include "src/common/xqc_malloc.h"
@@ -838,6 +839,9 @@ xqc_stream_path_metrics_on_recv(xqc_connection_t *conn, xqc_stream_t *stream, xq
 void
 xqc_path_send_buffer_append(xqc_path_ctx_t *path, xqc_packet_out_t *packet_out, xqc_list_head_t *head)
 {
+    uint64_t schedule_bytes_before = path->path_schedule_bytes;
+    xqc_send_type_t send_type;
+
     /* remove from conn send queue and  add to the path schduled buffer */
     xqc_list_del_init(&packet_out->po_list);
     xqc_list_add_tail(&packet_out->po_list, head);
@@ -852,11 +856,36 @@ xqc_path_send_buffer_append(xqc_path_ctx_t *path, xqc_packet_out_t *packet_out, 
             path->path_schedule_bytes += packet_out->po_cc_size;
         }
     }
+
+    if (xqc_transport_trace_enabled()) {
+        xqc_transport_trace_observation_t trace;
+
+        xqc_transport_trace_observation_init(&trace, "schedule_append",
+                                             "path_buffer");
+        xqc_transport_trace_fill_send_ctl(&trace, path->path_send_ctl);
+        xqc_transport_trace_fill_packet(&trace, packet_out);
+        trace.has_path = 1;
+        trace.path_id = path->path_id;
+        for (send_type = 0; send_type < XQC_SEND_TYPE_N; send_type++) {
+            if (head == &path->path_schedule_buf[send_type]) {
+                trace.send_type = send_type;
+                break;
+            }
+        }
+        trace.path_schedule_bytes_before = schedule_bytes_before;
+        trace.path_schedule_bytes_after = path->path_schedule_bytes;
+        xqc_transport_trace_notify(&trace);
+    }
+
+    packet_out->po_path_intent = 0;
+    packet_out->po_path_intent_id = 0;
 }
 
 void
 xqc_path_send_buffer_remove(xqc_path_ctx_t *path, xqc_packet_out_t *packet_out)
 {
+    uint64_t schedule_bytes_before = path->path_schedule_bytes;
+
     xqc_list_del_init(&packet_out->po_list);
 
     if (packet_out->po_flag & XQC_POF_IN_PATH_BUF_LIST) {
@@ -865,6 +894,20 @@ xqc_path_send_buffer_remove(xqc_path_ctx_t *path, xqc_packet_out_t *packet_out)
         if (XQC_IS_ACK_ELICITING(packet_out->po_frame_types)) {
             path->path_schedule_bytes -= packet_out->po_cc_size;
         }
+    }
+
+    if (xqc_transport_trace_enabled()) {
+        xqc_transport_trace_observation_t trace;
+
+        xqc_transport_trace_observation_init(&trace, "schedule_remove",
+                                             "path_buffer");
+        xqc_transport_trace_fill_send_ctl(&trace, path->path_send_ctl);
+        xqc_transport_trace_fill_packet(&trace, packet_out);
+        trace.has_path = 1;
+        trace.path_id = path->path_id;
+        trace.path_schedule_bytes_before = schedule_bytes_before;
+        trace.path_schedule_bytes_after = path->path_schedule_bytes;
+        xqc_transport_trace_notify(&trace);
     }
 }
 

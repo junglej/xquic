@@ -60,7 +60,7 @@ void xqc_send_queue_pre_destroy_packets_list(xqc_send_queue_t *send_queue, xqc_l
 
 xqc_packet_out_t *xqc_send_queue_get_packet_out(xqc_send_queue_t *send_queue, unsigned need, xqc_pkt_type_t pkt_type);
 xqc_packet_out_t *xqc_send_queue_get_packet_out_for_stream(xqc_send_queue_t *send_queue, unsigned need, xqc_pkt_type_t pkt_type,
-    xqc_stream_t *stream);
+    xqc_stream_t *stream, xqc_path_ctx_t *path_intent);
 int xqc_send_queue_out_queue_empty(xqc_send_queue_t *send_queue);
 
 
@@ -101,7 +101,6 @@ void xqc_send_queue_drop_stream_frame_packets(xqc_connection_t *conn, xqc_stream
 
 
 #endif /* _XQC_SEND_QUEUE_H_INCLUDED_ */
-
 
 
 
