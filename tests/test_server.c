@@ -186,6 +186,14 @@ static char g_stream_trace_path[512];
 static int g_stream_trace_disabled = 0;
 static uint64_t g_stream_trace_sample_us = 100000;
 static int g_stream_trace_full = 0;
+static FILE *g_recv_rate_trace_fp = NULL;
+static char g_recv_rate_trace_path[512];
+static int g_recv_rate_trace_enabled = 0;
+static int g_recv_rate_trace_disabled = 0;
+static uint64_t g_recv_rate_trace_interval_us = 200000;
+static uint64_t g_recv_rate_last_ts = 0;
+static uint64_t g_recv_rate_last_sum = 0;
+static uint64_t g_recv_rate_sum = 0;
 
 static int
 xqc_test_svr_apply_scheduler_name(const char *name, xqc_conn_settings_t *conn_settings)
@@ -434,6 +442,101 @@ xqc_server_close_request_trace(void)
         fclose(g_request_trace_fp);
         g_request_trace_fp = NULL;
     }
+}
+
+static int
+xqc_server_prepare_recv_rate_trace(void)
+{
+    long file_size;
+
+    if (!g_recv_rate_trace_enabled || g_recv_rate_trace_disabled) {
+        return -1;
+    }
+
+    if (g_recv_rate_trace_fp != NULL) {
+        return 0;
+    }
+
+    if (xqc_server_build_sibling_path(g_log_path, "server_recv_rate.csv",
+                                      g_recv_rate_trace_path, sizeof(g_recv_rate_trace_path)) != 0)
+    {
+        printf("recv rate trace path build failed\n");
+        g_recv_rate_trace_disabled = 1;
+        return -1;
+    }
+
+    g_recv_rate_trace_fp = fopen(g_recv_rate_trace_path, "a");
+    if (g_recv_rate_trace_fp == NULL) {
+        printf("open recv rate trace failed: %s\n", g_recv_rate_trace_path);
+        g_recv_rate_trace_disabled = 1;
+        return -1;
+    }
+
+    setvbuf(g_recv_rate_trace_fp, NULL, _IOLBF, 0);
+    if (fseek(g_recv_rate_trace_fp, 0, SEEK_END) != 0) {
+        file_size = -1;
+    } else {
+        file_size = ftell(g_recv_rate_trace_fp);
+    }
+
+    if (file_size == 0) {
+        fprintf(g_recv_rate_trace_fp,
+                "ts_us,interval_us,window_bytes,total_bytes,kbps\n");
+        fflush(g_recv_rate_trace_fp);
+    }
+
+    return 0;
+}
+
+static void
+xqc_server_close_recv_rate_trace(void)
+{
+    if (g_recv_rate_trace_fp != NULL) {
+        fclose(g_recv_rate_trace_fp);
+        g_recv_rate_trace_fp = NULL;
+    }
+}
+
+static void
+xqc_server_reset_recv_rate_trace_state(void)
+{
+    g_recv_rate_last_ts = 0;
+    g_recv_rate_last_sum = 0;
+    g_recv_rate_sum = 0;
+}
+
+static void
+xqc_server_record_socket_recv(size_t recv_bytes, uint64_t now)
+{
+    uint64_t interval_us;
+    uint64_t window_bytes;
+
+    g_recv_rate_sum += recv_bytes;
+
+    if (!g_recv_rate_trace_enabled) {
+        return;
+    }
+
+    if (g_recv_rate_last_ts == 0) {
+        g_recv_rate_last_ts = now;
+        g_recv_rate_last_sum = g_recv_rate_sum;
+        return;
+    }
+
+    interval_us = now - g_recv_rate_last_ts;
+    if (interval_us <= g_recv_rate_trace_interval_us) {
+        return;
+    }
+
+    window_bytes = g_recv_rate_sum - g_recv_rate_last_sum;
+    if (xqc_server_prepare_recv_rate_trace() == 0) {
+        fprintf(g_recv_rate_trace_fp, "%" PRIu64 ",%" PRIu64 ",%" PRIu64 ",%" PRIu64 ",%.3f\n",
+                now, interval_us, window_bytes, g_recv_rate_sum,
+                window_bytes * 8.0 * 1000 / interval_us);
+    }
+
+    g_recv_rate_last_ts = now;
+    g_recv_rate_last_sum = g_recv_rate_sum;
 }
 
 static xqc_server_request_trace_state_t *
@@ -2391,6 +2494,7 @@ xqc_server_socket_read_handler(xqc_server_ctx_t *ctx)
             uint64_t recv_time = xqc_now();
             for (int i = 0; i < retval; i++) {
                 recv_sum += msgs[i].msg_len;
+                xqc_server_record_socket_recv(msgs[i].msg_len, recv_time);
                 if (xqc_engine_packet_process(ctx->engine, iovecs[i].iov_base, msgs[i].msg_len,
                                               (struct sockaddr *) (&ctx->local_addr), ctx->local_addrlen,
                                               (struct sockaddr *) (&pa[i]), peer_addrlen,
@@ -2427,9 +2531,9 @@ xqc_server_socket_read_handler(xqc_server_ctx_t *ctx)
             }
         }
 
-        recv_sum += recv_size;
-
         recv_time = xqc_now();
+        recv_sum += recv_size;
+        xqc_server_record_socket_recv((size_t) recv_size, recv_time);
         //printf("xqc_server_read_handler recv_size=%zd, recv_time=%llu, now=%llu, recv_total=%d\n", recv_size, recv_time, xqc_now(), ++g_recv_total);
         /*printf("peer_ip: %s, peer_port: %d\n", inet_ntoa(ctx->peer_addr.sin_addr), ntohs(ctx->peer_addr.sin_port));
         printf("local_ip: %s, local_port: %d\n", inet_ntoa(ctx->local_addr.sin_addr), ntohs(ctx->local_addr.sin_port));*/
@@ -2875,8 +2979,11 @@ void usage(int argc, char *argv[]) {
 "   --request_trace_full          Log every request read_notify row.\n"
 "   --stream_trace_sample_ms <n>  Sample clean transport stream trace every n ms.\n"
 "   --stream_trace_full           Log every transport stream read_notify row.\n"
+"   --recv_rate_trace             Log server UDP receive rate samples.\n"
+"   --recv_rate_trace_interval_ms <n>\n"
+"                                  Server UDP receive rate sampling interval.\n"
 "   --scheduler <name>            Multipath scheduler: minrtt|backup|rap|macrtt_rap|musher|rr|roundrobin|red|redundant|mac_aware|xlink|blest|interop|backup_fec.\n"
-, prog);
+	, prog);
 }
 
 
@@ -2930,6 +3037,8 @@ int main(int argc, char *argv[]) {
         {"stream_trace_sample_ms", required_argument, &long_opt_index, 9},
         {"stream_trace_full", no_argument, &long_opt_index, 10},
         {"scheduler", required_argument, &long_opt_index, 11},
+        {"recv_rate_trace", no_argument, &long_opt_index, 12},
+        {"recv_rate_trace_interval_ms", required_argument, &long_opt_index, 13},
         {0, 0, 0, 0}
     };
 
@@ -3145,6 +3254,19 @@ int main(int argc, char *argv[]) {
             case 11:
                 snprintf(g_scheduler_name, sizeof(g_scheduler_name), "%s", optarg);
                 printf("option scheduler:%s\n", g_scheduler_name);
+                break;
+
+            case 12:
+                g_recv_rate_trace_enabled = 1;
+                printf("option recv rate trace logging\n");
+                break;
+
+            case 13:
+                g_recv_rate_trace_interval_us = (uint64_t) atoi(optarg) * 1000;
+                if (g_recv_rate_trace_interval_us == 0) {
+                    g_recv_rate_trace_interval_us = 200000;
+                }
+                printf("option recv rate trace interval ms :%s\n", optarg);
                 break;
 
             default:
@@ -3570,6 +3692,7 @@ int main(int argc, char *argv[]) {
 
     event_add(ctx.ev_socket, NULL);
     last_snd_ts = 0;
+    xqc_server_reset_recv_rate_trace_state();
     event_base_dispatch(eb);
 
     xqc_h3_ctx_destroy(ctx.engine);
@@ -3578,6 +3701,7 @@ int main(int argc, char *argv[]) {
     xqc_server_close_log_file(&ctx);
     xqc_server_close_request_trace();
     xqc_server_close_stream_trace();
+    xqc_server_close_recv_rate_trace();
     xqc_server_reset_request_trace_states();
     xqc_server_reset_stream_trace_states();
     destroy_cdf();
