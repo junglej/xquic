@@ -1559,8 +1559,9 @@ typedef enum {
 
 
 #define XQC_MAX_PATHS_COUNT 8
-#define XQC_CONN_INFO_LEN 400
+#define XQC_CONN_INFO_LEN 2048
 #define XQC_EXTERN_CONN_INFO_LEN 128
+#define XQC_SEND_AVAIL_INFO_LEN 2048
 
 typedef struct xqc_path_metrics_s {
     uint64_t            path_id;
@@ -1623,6 +1624,7 @@ typedef struct xqc_conn_stats_s {
 
     xqc_path_metrics_t  paths_info[XQC_MAX_PATHS_COUNT];
     char                conn_info[XQC_CONN_INFO_LEN];
+    char                send_availability_info[XQC_SEND_AVAIL_INFO_LEN];
 
     char                alpn[XQC_MAX_ALPN_BUF_LEN];
 

@@ -50,6 +50,7 @@ typedef struct xqc_wifi_monitor_config_s {
     const char                  *config_path;
     const char                  *ifname_primary;
     const char                  *ifname_secondary;
+    uint8_t                     debug_packet_trace;
     xqc_wifi_state_update_pt    state_update_cb;
     void                        *state_update_user_data;
 } xqc_wifi_monitor_config_t;

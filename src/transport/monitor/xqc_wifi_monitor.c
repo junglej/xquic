@@ -66,11 +66,36 @@ struct xqc_wifi_monitor_s {
     int                         stop_requested;
     int                         start_rc;
     int                         start_done;
+    int                         debug_packet_trace;
     char                        last_error[256];
     char                        output_dir[512];
     char                        config_path[512];
     char                        meta_path[512];
     char                        merged_mgmt_path[512];
+    char                        link_state_path[512];
+    FILE                       *link_state_fp;
+    uint64_t                    rb_wifi_pkt_events;
+    uint64_t                    rb_wifi_pkt_bad_size;
+    uint64_t                    state_update_attempts;
+    uint64_t                    state_update_gap_zero;
+    uint64_t                    state_update_unknown_ifindex;
+    uint64_t                    state_update_accepted;
+    uint64_t                    state_emit_count;
+    uint64_t                    state_emit_suppressed_interval;
+    uint64_t                    poll_calls;
+    uint64_t                    poll_events;
+    uint64_t                    poll_errors;
+    int                         last_poll_rc;
+    uint64_t                    last_event_ifindex;
+    uint64_t                    last_event_gap_us;
+    uint64_t                    last_event_ampdu_len;
+    uint64_t                    last_event_ampdu_ack_len;
+    uint64_t                    last_event_len;
+    uint64_t                    last_event_service_bytes;
+    uint64_t                    last_event_mac_rtt_us;
+    uint64_t                    last_event_protocol;
+    uint64_t                    last_event_dest_port;
+    uint64_t                    bpf_diag[XQC_WIFI_BPF_DIAG_MAX];
 };
 
 static xqc_wifi_monitor_t *g_xqc_wifi_monitor = NULL;
@@ -331,6 +356,136 @@ xqc_wifi_join_path(char *dst, size_t dst_len, const char *dir, const char *name)
     return 0;
 }
 
+static int
+xqc_wifi_env_enabled(const char *name)
+{
+    const char *value;
+
+    if (name == NULL) {
+        return 0;
+    }
+
+    value = getenv(name);
+    return value != NULL && value[0] != '\0' && value[0] != '0';
+}
+
+static const char *
+xqc_wifi_state_label(xqc_wifi_path_state_t state)
+{
+    switch (state) {
+    case XQC_WIFI_PATH_STATE_REGULAR:
+        return "REGULAR";
+    case XQC_WIFI_PATH_STATE_DEGRADED_CSMA:
+        return "DEGRADED_CSMA";
+    default:
+        return "UNKNOWN";
+    }
+}
+
+static const char *
+xqc_wifi_bpf_diag_name(int key)
+{
+    switch (key) {
+    case XQC_WIFI_BPF_DIAG_TX_STATUS_ENTER:
+        return "tx_status_enter";
+    case XQC_WIFI_BPF_DIAG_TX_STATUS_SKB_NULL:
+        return "tx_status_skb_null";
+    case XQC_WIFI_BPF_DIAG_TX_STATUS_PROTO_SKIP:
+        return "tx_status_proto_skip";
+    case XQC_WIFI_BPF_DIAG_TX_STATUS_INFO_NULL:
+        return "tx_status_info_null";
+    case XQC_WIFI_BPF_DIAG_TX_STATUS_AMPDU_ZERO_STATE_ONLY:
+        return "tx_status_ampdu_zero_state_only";
+    case XQC_WIFI_BPF_DIAG_TX_STATUS_RING_RESERVE_FAIL:
+        return "tx_status_ring_reserve_fail";
+    case XQC_WIFI_BPF_DIAG_TX_STATUS_FLOW_MISMATCH:
+        return "tx_status_flow_mismatch";
+    case XQC_WIFI_BPF_DIAG_TX_STATUS_TX_IFINDEX_ZERO:
+        return "tx_status_tx_ifindex_zero";
+    case XQC_WIFI_BPF_DIAG_TX_STATUS_GAP_ZERO_STATE_ONLY:
+        return "tx_status_gap_zero_state_only";
+    case XQC_WIFI_BPF_DIAG_TX_STATUS_STATE_SAMPLE_SKIP:
+        return "tx_status_state_sample_skip";
+    case XQC_WIFI_BPF_DIAG_TX_STATUS_RING_SUBMIT:
+        return "tx_status_ring_submit";
+    case XQC_WIFI_BPF_DIAG_XMIT_FAST_ENTER:
+        return "xmit_fast_enter";
+    case XQC_WIFI_BPF_DIAG_XMIT_FAST_FLOW_MISMATCH:
+        return "xmit_fast_flow_mismatch";
+    case XQC_WIFI_BPF_DIAG_XMIT_FAST_TRACK_STATE_ONLY:
+        return "xmit_fast_track_state_only";
+    default:
+        return "unknown";
+    }
+}
+
+static void
+xqc_wifi_monitor_note_wifi_pkt_event(xqc_wifi_monitor_t *monitor,
+    const struct event_wifi_pkt *event, size_t data_sz)
+{
+    if (monitor == NULL) {
+        return;
+    }
+
+    pthread_mutex_lock(&monitor->lock);
+    monitor->rb_wifi_pkt_events++;
+    if (event == NULL || data_sz < sizeof(*event)) {
+        monitor->rb_wifi_pkt_bad_size++;
+        pthread_mutex_unlock(&monitor->lock);
+        return;
+    }
+
+    monitor->last_event_ifindex = event->tx_ifindex;
+    monitor->last_event_gap_us = event->gap;
+    monitor->last_event_ampdu_len = event->ampdu_len;
+    monitor->last_event_ampdu_ack_len = event->ampdu_ack_len;
+    monitor->last_event_len = event->len;
+    monitor->last_event_service_bytes = event->service_bytes;
+    monitor->last_event_mac_rtt_us = event->mac_rtt_us;
+    monitor->last_event_protocol = event->protocol;
+    monitor->last_event_dest_port = ntohs(event->dest_port);
+    pthread_mutex_unlock(&monitor->lock);
+}
+
+static void
+xqc_wifi_log_link_state(xqc_wifi_monitor_t *monitor,
+    const xqc_wifi_state_snapshot_t *snapshot)
+{
+    if (monitor == NULL || snapshot == NULL || monitor->link_state_fp == NULL) {
+        return;
+    }
+
+    fprintf(monitor->link_state_fp,
+        "%llu,%s,%u,%s,%llu,%llu,%llu,%llu,%u,%llu,"
+        "%.3f,%.3f,%.3f,%.3f,%.3f,%.6f,%.6f,%.6f,"
+        "%llu,%llu,%.6f,%.6f,%.6f,%.6f,%.6f\n",
+        (unsigned long long) snapshot->ts_us,
+        snapshot->ifname[0] ? snapshot->ifname : "-",
+        snapshot->ifindex,
+        xqc_wifi_state_label(snapshot->state),
+        (unsigned long long) snapshot->sample_count,
+        (unsigned long long) snapshot->last_gap_us,
+        (unsigned long long) snapshot->last_mac_rtt_us,
+        (unsigned long long) snapshot->last_service_bytes,
+        snapshot->last_amsdu_subframes,
+        (unsigned long long) snapshot->last_amsdu_bytes,
+        snapshot->ewma_gap_us,
+        snapshot->ewma_airtime_us,
+        snapshot->ewma_mac_rtt_us,
+        snapshot->ewma_service_bytes,
+        snapshot->ewma_service_time_us,
+        snapshot->service_rate_bytes_per_us,
+        snapshot->p_long_gap,
+        snapshot->pi_degraded,
+        (unsigned long long) snapshot->tail_p50_us,
+        (unsigned long long) snapshot->tail_p95_us,
+        snapshot->tail_ratio,
+        snapshot->tail_baseline,
+        snapshot->tail_excess,
+        snapshot->cusum_on,
+        snapshot->cusum_off);
+}
+
 static void
 xqc_wifi_emit_state_locked(xqc_wifi_monitor_t *monitor,
     xqc_wifi_iface_state_t *iface_state, uint64_t ts_us, int force)
@@ -344,12 +499,16 @@ xqc_wifi_emit_state_locked(xqc_wifi_monitor_t *monitor,
     if (!force && iface_state->last_logged_ts_us != 0
         && ts_us < iface_state->last_logged_ts_us + XQC_WIFI_MONITOR_LOG_INTERVAL_US)
     {
+        monitor->state_emit_suppressed_interval++;
         return;
     }
 
     snapshot = iface_state->snapshot;
     snapshot.ts_us = ts_us;
     iface_state->last_logged_ts_us = ts_us;
+    monitor->state_emit_count++;
+
+    xqc_wifi_log_link_state(monitor, &snapshot);
 
     pthread_mutex_unlock(&monitor->lock);
     monitor->config.state_update_cb(&snapshot, monitor->config.state_update_user_data);
@@ -378,16 +537,25 @@ xqc_wifi_update_iface_state(xqc_wifi_monitor_t *monitor,
     double log_lr;
     int long_gap;
 
-    if (monitor == NULL || event == NULL || event->gap == 0) {
+    if (monitor == NULL || event == NULL) {
         return;
     }
 
     pthread_mutex_lock(&monitor->lock);
-    iface_state = xqc_wifi_find_iface_locked(monitor, event->tx_ifindex);
-    if (iface_state == NULL) {
+    monitor->state_update_attempts++;
+    if (event->gap == 0) {
+        monitor->state_update_gap_zero++;
         pthread_mutex_unlock(&monitor->lock);
         return;
     }
+
+    iface_state = xqc_wifi_find_iface_locked(monitor, event->tx_ifindex);
+    if (iface_state == NULL) {
+        monitor->state_update_unknown_ifindex++;
+        pthread_mutex_unlock(&monitor->lock);
+        return;
+    }
+    monitor->state_update_accepted++;
 
     get_tm(event->ts_ns, offset, &sec, &nsec);
     ts_us = sec * 1000000ULL + nsec / 1000ULL;
@@ -471,9 +639,17 @@ xqc_wifi_update_iface_state(xqc_wifi_monitor_t *monitor,
 static int
 xqc_embedded_handle_wifi_pkt(void *ctx, void *data, size_t data_sz)
 {
-    int ret;
+    int ret = 0;
 
-    ret = handle_wifi_pkt(ctx, data, data_sz);
+    if (g_xqc_wifi_monitor != NULL && g_xqc_wifi_monitor->debug_packet_trace) {
+        ret = handle_wifi_pkt(ctx, data, data_sz);
+    }
+    if (g_xqc_wifi_monitor != NULL) {
+        xqc_wifi_monitor_note_wifi_pkt_event(g_xqc_wifi_monitor,
+            data_sz >= sizeof(struct event_wifi_pkt)
+                ? (const struct event_wifi_pkt *) data : NULL,
+            data_sz);
+    }
     if (g_xqc_wifi_monitor != NULL && data_sz >= sizeof(struct event_wifi_pkt)) {
         xqc_wifi_update_iface_state(g_xqc_wifi_monitor,
             (const struct event_wifi_pkt *) data, *(long long *) ctx);
@@ -485,18 +661,30 @@ xqc_embedded_handle_wifi_pkt(void *ctx, void *data, size_t data_sz)
 static int
 xqc_embedded_handle_wifi_rx(void *ctx, void *data, size_t data_sz)
 {
+    if (g_xqc_wifi_monitor == NULL || !g_xqc_wifi_monitor->debug_packet_trace) {
+        return 0;
+    }
+
     return handle_wifi_rx(ctx, data, data_sz);
 }
 
 static int
 xqc_embedded_handle_mac_tx(void *ctx, void *data, size_t data_sz)
 {
+    if (g_xqc_wifi_monitor == NULL || !g_xqc_wifi_monitor->debug_packet_trace) {
+        return 0;
+    }
+
     return handle_mac_tx(ctx, data, data_sz);
 }
 
 static int
 xqc_embedded_handle_drop(void *ctx, void *data, size_t data_sz)
 {
+    if (g_xqc_wifi_monitor == NULL || !g_xqc_wifi_monitor->debug_packet_trace) {
+        return 0;
+    }
+
     return handle_drop(ctx, data, data_sz);
 }
 
@@ -508,6 +696,40 @@ xqc_wifi_monitor_set_error(xqc_wifi_monitor_t *monitor, const char *message)
     }
 
     snprintf(monitor->last_error, sizeof(monitor->last_error), "%s", message);
+}
+
+static int
+xqc_wifi_monitor_open_link_state(xqc_wifi_monitor_t *monitor)
+{
+    if (monitor == NULL || monitor->link_state_path[0] == '\0') {
+        return -1;
+    }
+
+    monitor->link_state_fp = fopen(monitor->link_state_path, "w");
+    if (monitor->link_state_fp == NULL) {
+        return -1;
+    }
+
+    fprintf(monitor->link_state_fp,
+        "ts_us,ifname,ifindex,state,sample_count,last_gap_us,"
+        "last_mac_rtt_us,last_service_bytes,last_amsdu_subframes,"
+        "last_amsdu_bytes,ewma_gap_us,ewma_airtime_us,ewma_mac_rtt_us,"
+        "ewma_service_bytes,ewma_service_time_us,service_rate_bytes_per_us,"
+        "p_long_gap,pi_degraded,tail_p50_us,tail_p95_us,tail_ratio,"
+        "tail_baseline,tail_excess,cusum_on,cusum_off\n");
+    return 0;
+}
+
+static void
+xqc_wifi_monitor_close_link_state(xqc_wifi_monitor_t *monitor)
+{
+    if (monitor == NULL || monitor->link_state_fp == NULL) {
+        return;
+    }
+
+    fflush(monitor->link_state_fp);
+    fclose(monitor->link_state_fp);
+    monitor->link_state_fp = NULL;
 }
 
 static int
@@ -561,6 +783,7 @@ static void
 xqc_wifi_monitor_write_meta(xqc_wifi_monitor_t *monitor)
 {
     FILE *fp;
+    int i;
 
     if (monitor == NULL || monitor->meta_path[0] == '\0') {
         return;
@@ -576,13 +799,108 @@ xqc_wifi_monitor_write_meta(xqc_wifi_monitor_t *monitor)
     fprintf(fp, "  \"start_rc\": %d,\n", monitor->start_rc);
     fprintf(fp, "  \"output_dir\": \"%s\",\n", monitor->output_dir);
     fprintf(fp, "  \"config_path\": \"%s\",\n", monitor->config_path);
+    fprintf(fp, "  \"debug_packet_trace\": %s,\n",
+        monitor->debug_packet_trace ? "true" : "false");
+    fprintf(fp, "  \"link_state_path\": \"%s\",\n", monitor->link_state_path);
     fprintf(fp, "  \"ifname_primary\": \"%s\",\n",
         monitor->iface_count > 0 ? monitor->ifaces[0].ifname : "");
     fprintf(fp, "  \"ifname_secondary\": \"%s\",\n",
         monitor->iface_count > 1 ? monitor->ifaces[1].ifname : "");
-    fprintf(fp, "  \"last_error\": \"%s\"\n", monitor->last_error);
+    fprintf(fp, "  \"last_error\": \"%s\",\n", monitor->last_error);
+    fprintf(fp, "  \"counters\": {\n");
+    fprintf(fp, "    \"rb_wifi_pkt_events\": %llu,\n",
+        (unsigned long long) monitor->rb_wifi_pkt_events);
+    fprintf(fp, "    \"rb_wifi_pkt_bad_size\": %llu,\n",
+        (unsigned long long) monitor->rb_wifi_pkt_bad_size);
+    fprintf(fp, "    \"state_update_attempts\": %llu,\n",
+        (unsigned long long) monitor->state_update_attempts);
+    fprintf(fp, "    \"state_update_gap_zero\": %llu,\n",
+        (unsigned long long) monitor->state_update_gap_zero);
+    fprintf(fp, "    \"state_update_unknown_ifindex\": %llu,\n",
+        (unsigned long long) monitor->state_update_unknown_ifindex);
+    fprintf(fp, "    \"state_update_accepted\": %llu,\n",
+        (unsigned long long) monitor->state_update_accepted);
+    fprintf(fp, "    \"state_emit_count\": %llu,\n",
+        (unsigned long long) monitor->state_emit_count);
+    fprintf(fp, "    \"state_emit_suppressed_interval\": %llu,\n",
+        (unsigned long long) monitor->state_emit_suppressed_interval);
+    fprintf(fp, "    \"poll_calls\": %llu,\n",
+        (unsigned long long) monitor->poll_calls);
+    fprintf(fp, "    \"poll_events\": %llu,\n",
+        (unsigned long long) monitor->poll_events);
+    fprintf(fp, "    \"poll_errors\": %llu,\n",
+        (unsigned long long) monitor->poll_errors);
+    fprintf(fp, "    \"last_poll_rc\": %d,\n", monitor->last_poll_rc);
+    fprintf(fp, "    \"last_event_ifindex\": %llu,\n",
+        (unsigned long long) monitor->last_event_ifindex);
+    fprintf(fp, "    \"last_event_gap_us\": %llu,\n",
+        (unsigned long long) monitor->last_event_gap_us);
+    fprintf(fp, "    \"last_event_ampdu_len\": %llu,\n",
+        (unsigned long long) monitor->last_event_ampdu_len);
+    fprintf(fp, "    \"last_event_ampdu_ack_len\": %llu,\n",
+        (unsigned long long) monitor->last_event_ampdu_ack_len);
+    fprintf(fp, "    \"last_event_len\": %llu,\n",
+        (unsigned long long) monitor->last_event_len);
+    fprintf(fp, "    \"last_event_service_bytes\": %llu,\n",
+        (unsigned long long) monitor->last_event_service_bytes);
+    fprintf(fp, "    \"last_event_mac_rtt_us\": %llu,\n",
+        (unsigned long long) monitor->last_event_mac_rtt_us);
+    fprintf(fp, "    \"last_event_protocol\": %llu,\n",
+        (unsigned long long) monitor->last_event_protocol);
+    fprintf(fp, "    \"last_event_dest_port\": %llu\n",
+        (unsigned long long) monitor->last_event_dest_port);
+    fprintf(fp, "  },\n");
+    fprintf(fp, "  \"ifaces\": [\n");
+    for (i = 0; i < monitor->iface_count; i++) {
+        xqc_wifi_iface_state_t *iface = &monitor->ifaces[i];
+        fprintf(fp,
+            "    {\"ifname\": \"%s\", \"ifindex\": %u, \"sample_count\": %llu, "
+            "\"state\": \"%s\", \"last_update_ts_us\": %llu}%s\n",
+            iface->ifname,
+            iface->ifindex,
+            (unsigned long long) iface->snapshot.sample_count,
+            xqc_wifi_state_label(iface->snapshot.state),
+            (unsigned long long) iface->snapshot.last_update_ts_us,
+            i + 1 < monitor->iface_count ? "," : "");
+    }
+    fprintf(fp, "  ],\n");
+    fprintf(fp, "  \"bpf_diag\": {\n");
+    for (i = 0; i < XQC_WIFI_BPF_DIAG_MAX; i++) {
+        fprintf(fp, "    \"%s\": %llu%s\n",
+            xqc_wifi_bpf_diag_name(i),
+            (unsigned long long) monitor->bpf_diag[i],
+            i + 1 < XQC_WIFI_BPF_DIAG_MAX ? "," : "");
+    }
+    fprintf(fp, "  }\n");
     fprintf(fp, "}\n");
     fclose(fp);
+}
+
+static void
+xqc_wifi_monitor_read_bpf_diag(xqc_wifi_monitor_t *monitor,
+    struct monitor_bpf *skel)
+{
+    int fd;
+    __u32 key;
+    __u64 value;
+
+    if (monitor == NULL || skel == NULL) {
+        return;
+    }
+
+    fd = bpf_map__fd(skel->maps.xqc_wifi_bpf_diag_map);
+    if (fd < 0) {
+        return;
+    }
+
+    pthread_mutex_lock(&monitor->lock);
+    for (key = 0; key < XQC_WIFI_BPF_DIAG_MAX; key++) {
+        value = 0;
+        if (bpf_map_lookup_elem(fd, &key, &value) == 0) {
+            monitor->bpf_diag[key] = value;
+        }
+    }
+    pthread_mutex_unlock(&monitor->lock);
 }
 
 static void
@@ -699,7 +1017,15 @@ xqc_wifi_monitor_thread_main(void *arg)
     offset = ((long long) rt.tv_sec * 1000000000LL + rt.tv_nsec)
         - ((long long) mt.tv_sec * 1000000000LL + mt.tv_nsec);
 
-    xqc_wifi_monitor_open_outputs(monitor);
+    if (xqc_wifi_monitor_open_link_state(monitor) != 0) {
+        xqc_wifi_monitor_set_error(monitor, "open Wi-Fi link state log failed");
+        xqc_wifi_monitor_update_status(monitor, -1, 0, 1);
+        goto cleanup;
+    }
+
+    if (monitor->debug_packet_trace) {
+        xqc_wifi_monitor_open_outputs(monitor);
+    }
 
     skel = monitor_bpf__open();
     if (skel == NULL) {
@@ -715,21 +1041,22 @@ xqc_wifi_monitor_thread_main(void *arg)
         goto cleanup;
     }
 
+    config_map_fd = bpf_map__fd(skel->maps.filter_config_map);
+    if (config_map_fd >= 0) {
+        g_filter_cfg.xqc_state_only = monitor->debug_packet_trace ? 0 : 1;
+        bpf_map_update_elem(config_map_fd, &key, &g_filter_cfg, BPF_ANY);
+    }
+
+    g_bssid_filter_map_fd = bpf_map__fd(skel->maps.bssid_filter_map);
+    if (monitor->debug_packet_trace && g_bssid_filter_map_fd >= 0) {
+        apply_current_bssid_filter(&empty_bssid);
+    }
+
     err = monitor_bpf__attach(skel);
     if (err) {
         xqc_wifi_monitor_set_error(monitor, "attach BPF skeleton failed");
         xqc_wifi_monitor_update_status(monitor, err, 0, 1);
         goto cleanup;
-    }
-
-    config_map_fd = bpf_map__fd(skel->maps.filter_config_map);
-    if (config_map_fd >= 0) {
-        bpf_map_update_elem(config_map_fd, &key, &g_filter_cfg, BPF_ANY);
-    }
-
-    g_bssid_filter_map_fd = bpf_map__fd(skel->maps.bssid_filter_map);
-    if (g_bssid_filter_map_fd >= 0) {
-        apply_current_bssid_filter(&empty_bssid);
     }
 
     rb = ring_buffer__new(bpf_map__fd(skel->maps.rb_wifi_pkt),
@@ -741,26 +1068,28 @@ xqc_wifi_monitor_thread_main(void *arg)
         goto cleanup;
     }
 
-    ring_buffer__add(rb, bpf_map__fd(skel->maps.rb_wifi_rx),
-        xqc_embedded_handle_wifi_rx, &offset);
-    ring_buffer__add(rb, bpf_map__fd(skel->maps.rb_mac_tx),
-        xqc_embedded_handle_mac_tx, &offset);
-    ring_buffer__add(rb, bpf_map__fd(skel->maps.rb_drop),
-        xqc_embedded_handle_drop, &offset);
+    if (monitor->debug_packet_trace) {
+        ring_buffer__add(rb, bpf_map__fd(skel->maps.rb_wifi_rx),
+            xqc_embedded_handle_wifi_rx, &offset);
+        ring_buffer__add(rb, bpf_map__fd(skel->maps.rb_mac_tx),
+            xqc_embedded_handle_mac_tx, &offset);
+        ring_buffer__add(rb, bpf_map__fd(skel->maps.rb_drop),
+            xqc_embedded_handle_drop, &offset);
 
-    strncpy(mgmt_ctx1.ifname, g_ifname, IF_NAMESIZE - 1);
-    mgmt_ctx1.ifname[IF_NAMESIZE - 1] = '\0';
-    mgmt_ctx1.fp_mgmt = fp_mgmt;
-    if (pthread_create(&tid_mgmt, NULL, mgmt_thread, &mgmt_ctx1) == 0) {
-        mgmt1_started = 1;
-    }
+        strncpy(mgmt_ctx1.ifname, g_ifname, IF_NAMESIZE - 1);
+        mgmt_ctx1.ifname[IF_NAMESIZE - 1] = '\0';
+        mgmt_ctx1.fp_mgmt = fp_mgmt;
+        if (pthread_create(&tid_mgmt, NULL, mgmt_thread, &mgmt_ctx1) == 0) {
+            mgmt1_started = 1;
+        }
 
-    if (g_ifname2[0] != '\0') {
-        strncpy(mgmt_ctx2.ifname, g_ifname2, IF_NAMESIZE - 1);
-        mgmt_ctx2.ifname[IF_NAMESIZE - 1] = '\0';
-        mgmt_ctx2.fp_mgmt = fp_mgmt2;
-        if (pthread_create(&tid_mgmt2, NULL, mgmt_thread, &mgmt_ctx2) == 0) {
-            mgmt2_started = 1;
+        if (g_ifname2[0] != '\0') {
+            strncpy(mgmt_ctx2.ifname, g_ifname2, IF_NAMESIZE - 1);
+            mgmt_ctx2.ifname[IF_NAMESIZE - 1] = '\0';
+            mgmt_ctx2.fp_mgmt = fp_mgmt2;
+            if (pthread_create(&tid_mgmt2, NULL, mgmt_thread, &mgmt_ctx2) == 0) {
+                mgmt2_started = 1;
+            }
         }
     }
 
@@ -769,6 +1098,15 @@ xqc_wifi_monitor_thread_main(void *arg)
 
     while (!monitor->stop_requested && !exiting) {
         err = ring_buffer__poll(rb, 100);
+        pthread_mutex_lock(&monitor->lock);
+        monitor->poll_calls++;
+        monitor->last_poll_rc = err;
+        if (err > 0) {
+            monitor->poll_events += err;
+        } else if (err < 0 && err != -EINTR) {
+            monitor->poll_errors++;
+        }
+        pthread_mutex_unlock(&monitor->lock);
         if (err == -EINTR) {
             err = 0;
             break;
@@ -792,6 +1130,7 @@ cleanup:
     if (mgmt2_started) {
         pthread_join(tid_mgmt2, NULL);
     }
+    xqc_wifi_monitor_read_bpf_diag(monitor, skel);
     if (rb) {
         ring_buffer__free(rb);
     }
@@ -800,7 +1139,10 @@ cleanup:
         monitor_bpf__destroy(skel);
     }
     close_all_files();
-    xqc_wifi_monitor_merge_mgmt(monitor);
+    xqc_wifi_monitor_close_link_state(monitor);
+    if (monitor->debug_packet_trace) {
+        xqc_wifi_monitor_merge_mgmt(monitor);
+    }
     xqc_wifi_monitor_write_meta(monitor);
     g_xqc_wifi_monitor = NULL;
     return NULL;
@@ -830,6 +1172,8 @@ xqc_wifi_monitor_start(xqc_wifi_monitor_t **monitor_out,
 
     pthread_mutex_init(&monitor->lock, NULL);
     monitor->config = *config;
+    monitor->debug_packet_trace = config->debug_packet_trace
+        || xqc_wifi_env_enabled("XQC_WIFI_MONITOR_PACKET_CSV");
     xqc_wifi_copy_cstr(monitor->output_dir, sizeof(monitor->output_dir), config->output_dir);
     xqc_wifi_copy_cstr(monitor->config_path, sizeof(monitor->config_path),
         config->config_path ? config->config_path : "ebpf-wifi-insider/config.json");
@@ -837,6 +1181,8 @@ xqc_wifi_monitor_start(xqc_wifi_monitor_t **monitor_out,
         monitor->output_dir, "wifi_module_meta.json");
     xqc_wifi_join_path(monitor->merged_mgmt_path, sizeof(monitor->merged_mgmt_path),
         monitor->output_dir, "mgmt_trace.csv");
+    xqc_wifi_join_path(monitor->link_state_path, sizeof(monitor->link_state_path),
+        monitor->output_dir, "wifi_link_state.csv");
 
     xqc_wifi_copy_cstr(monitor->ifaces[0].ifname, sizeof(monitor->ifaces[0].ifname),
         config->ifname_primary);

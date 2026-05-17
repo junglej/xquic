@@ -1904,6 +1904,65 @@ xqc_conn_try_to_update_mss(xqc_connection_t *conn)
 }
 
 
+static ssize_t
+xqc_send_burst_iov_bytes(struct iovec *iov, int cnt)
+{
+    ssize_t bytes = 0;
+    int i;
+
+    if (iov == NULL || cnt <= 0) {
+        return 0;
+    }
+
+    for (i = 0; i < cnt; i++) {
+        bytes += iov[i].iov_len;
+    }
+
+    return bytes;
+}
+
+static void
+xqc_path_record_send_burst_stats(xqc_path_ctx_t *path, struct iovec *iov,
+    int cnt, ssize_t sent_cnt)
+{
+    xqc_path_send_availability_stats_t *stats;
+    int sent_pkts = 0;
+    ssize_t requested_bytes;
+    ssize_t sent_bytes = 0;
+
+    if (path == NULL || cnt <= 0) {
+        return;
+    }
+
+    stats = &path->send_avail_stats;
+    requested_bytes = xqc_send_burst_iov_bytes(iov, cnt);
+
+    stats->send_burst_calls++;
+    stats->send_burst_requested_pkts += cnt;
+    stats->send_burst_requested_bytes += requested_bytes;
+
+    if (sent_cnt >= 0) {
+        sent_pkts = sent_cnt > cnt ? cnt : (int) sent_cnt;
+        sent_bytes = xqc_send_burst_iov_bytes(iov, sent_pkts);
+        stats->send_burst_sent_pkts += sent_pkts;
+        stats->send_burst_sent_bytes += sent_bytes;
+        if (sent_pkts < cnt) {
+            stats->send_burst_partial++;
+            stats->send_burst_partial_unsent_pkts += cnt - sent_pkts;
+        }
+        return;
+    }
+
+    if (sent_cnt == -XQC_EAGAIN) {
+        stats->send_burst_eagain++;
+        stats->send_burst_eagain_requested_pkts += cnt;
+        stats->send_burst_eagain_requested_bytes += requested_bytes;
+        return;
+    }
+
+    stats->send_burst_socket_error++;
+}
+
 ssize_t
 xqc_send_burst(xqc_connection_t *conn, xqc_path_ctx_t *path, struct iovec *iov, int cnt)
 {
@@ -1944,7 +2003,13 @@ xqc_send_burst(xqc_connection_t *conn, xqc_path_ctx_t *path, struct iovec *iov, 
                                                 xqc_conn_get_user_data(conn));
 
         if (sent_cnt < 0) {
-            xqc_log(conn->log, XQC_LOG_ERROR, "|error send mmsg|");
+            if (sent_cnt == XQC_SOCKET_EAGAIN) {
+                xqc_log(conn->log, XQC_LOG_DEBUG, "|send mmsg eagain|path:%ui|cnt:%d|",
+                        path->path_id, cnt);
+            } else {
+                xqc_log(conn->log, XQC_LOG_ERROR, "|error send mmsg|path:%ui|ret:%d|cnt:%d|",
+                        path->path_id, sent_cnt, cnt);
+            }
             if (sent_cnt == XQC_SOCKET_ERROR) {
                 path->path_flag |= XQC_PATH_FLAG_SOCKET_ERROR;
                 if (xqc_conn_should_close(conn, path)) {
@@ -1963,7 +2028,12 @@ xqc_send_burst(xqc_connection_t *conn, xqc_path_ctx_t *path, struct iovec *iov, 
                                               conn->peer_addrlen,
                                               xqc_conn_get_user_data(conn));
         if (sent_cnt < 0) {
-            xqc_log(conn->log, XQC_LOG_ERROR, "|error send mmsg|");
+            if (sent_cnt == XQC_SOCKET_EAGAIN) {
+                xqc_log(conn->log, XQC_LOG_DEBUG, "|send mmsg eagain|cnt:%d|", cnt);
+            } else {
+                xqc_log(conn->log, XQC_LOG_ERROR, "|error send mmsg|ret:%d|cnt:%d|",
+                        sent_cnt, cnt);
+            }
             if (sent_cnt == XQC_SOCKET_ERROR) {
                 xqc_log(conn->log, XQC_LOG_ERROR, "|socket exception, close connection|");
                 conn->conn_state = XQC_CONN_STATE_CLOSED;
@@ -1974,6 +2044,7 @@ xqc_send_burst(xqc_connection_t *conn, xqc_path_ctx_t *path, struct iovec *iov, 
         }
     }
 
+    xqc_path_record_send_burst_stats(path, iov, cnt, sent_cnt);
     return sent_cnt;
 }
 
@@ -1999,6 +2070,24 @@ xqc_check_acked_or_dropped_pkt(xqc_connection_t *conn,
     return XQC_FALSE;
 }
 
+static void
+xqc_path_record_scheduler_selection(xqc_path_ctx_t *path,
+    const xqc_packet_out_t *packet_out)
+{
+    xqc_path_send_availability_stats_t *stats;
+
+    if (path == NULL || packet_out == NULL) {
+        return;
+    }
+
+    stats = &path->send_avail_stats;
+    stats->scheduler_selected_pkts++;
+    stats->scheduler_selected_bytes += packet_out->po_used_size;
+    if (xqc_path_is_full(path)) {
+        stats->scheduler_selected_cwnd_full++;
+    }
+}
+
 
 void
 xqc_conn_schedule_packets(xqc_connection_t *conn,  xqc_list_head_t *head, 
@@ -2020,6 +2109,7 @@ xqc_conn_schedule_packets(xqc_connection_t *conn,  xqc_list_head_t *head,
     xqc_list_for_each_safe(pos, next, head) {
         packet_out = xqc_list_entry(pos, xqc_packet_out_t, po_list);
         cc_blocked = XQC_FALSE;
+        xqc_bool_t scheduler_selected_path = XQC_FALSE;
         /* 1. 已设置特定路径发送的包，例如：PATH_CHALLENGE PATH_RESPONSE MP_ACK(原路径ACK) */
         if (xqc_packet_out_on_specific_path(conn, packet_out, &path)) {
             if (path == NULL) {
@@ -2061,6 +2151,7 @@ xqc_conn_schedule_packets(xqc_connection_t *conn,  xqc_list_head_t *head,
                                               packets_are_limited_by_cc,
                                               0, &cc_blocked);
             }
+            scheduler_selected_path = path != NULL;
             if (path == NULL) {
                 if (xqc_transport_trace_enabled()) {
                     xqc_transport_trace_observation_t trace;
@@ -2103,6 +2194,9 @@ xqc_conn_schedule_packets(xqc_connection_t *conn,  xqc_list_head_t *head,
         }
 #endif
 
+        if (scheduler_selected_path) {
+            xqc_path_record_scheduler_selection(path, packet_out);
+        }
         xqc_path_send_buffer_append(path, packet_out, &path->path_schedule_buf[send_type]);
     }
     if (conn->conn_settings.fec_params.fec_encoder_scheme == XQC_PACKET_MASK_CODE
@@ -3690,6 +3784,84 @@ full:
     buff[buff_size - 1] = '\0';
 }
 
+void
+xqc_conn_send_availability_info_print(xqc_connection_t *conn,
+    xqc_conn_stats_t *conn_stats)
+{
+    char *buff;
+    size_t buff_size;
+    size_t curr_size = 0;
+    int ret;
+    xqc_list_head_t *pos, *next;
+    xqc_path_ctx_t *path = NULL;
+
+    if (conn == NULL || conn_stats == NULL) {
+        return;
+    }
+
+    buff = conn_stats->send_availability_info;
+    buff_size = XQC_SEND_AVAIL_INFO_LEN;
+    if (buff_size == 0) {
+        return;
+    }
+    buff[0] = '\0';
+
+    xqc_list_for_each_safe(pos, next, &conn->conn_paths_list) {
+        xqc_path_send_availability_stats_t *stats;
+        uint32_t loss_cnt = 0;
+        uint32_t tlp_cnt = 0;
+
+        path = xqc_list_entry(pos, xqc_path_ctx_t, path_list);
+        if (path == NULL) {
+            continue;
+        }
+
+        stats = &path->send_avail_stats;
+        if (path->path_send_ctl != NULL) {
+            loss_cnt = path->path_send_ctl->ctl_lost_count;
+            tlp_cnt = path->path_send_ctl->ctl_tlp_count;
+        }
+
+        ret = snprintf(buff + curr_size, buff_size - curr_size,
+                       "%spath=%"PRIu64",sched_pkts=%"PRIu64",sched_bytes=%"PRIu64","
+                       "sched_cwnd_full=%"PRIu64",burst_calls=%"PRIu64","
+                       "burst_req_pkts=%"PRIu64",burst_req_bytes=%"PRIu64","
+                       "burst_sent_pkts=%"PRIu64",burst_sent_bytes=%"PRIu64","
+                       "burst_partial=%"PRIu64",partial_unsent_pkts=%"PRIu64","
+                       "burst_eagain=%"PRIu64",eagain_req_pkts=%"PRIu64","
+                       "eagain_req_bytes=%"PRIu64",socket_error=%"PRIu64","
+                       "loss=%u,tlp=%u",
+                       curr_size == 0 ? "" : ";",
+                       path->path_id,
+                       stats->scheduler_selected_pkts,
+                       stats->scheduler_selected_bytes,
+                       stats->scheduler_selected_cwnd_full,
+                       stats->send_burst_calls,
+                       stats->send_burst_requested_pkts,
+                       stats->send_burst_requested_bytes,
+                       stats->send_burst_sent_pkts,
+                       stats->send_burst_sent_bytes,
+                       stats->send_burst_partial,
+                       stats->send_burst_partial_unsent_pkts,
+                       stats->send_burst_eagain,
+                       stats->send_burst_eagain_requested_pkts,
+                       stats->send_burst_eagain_requested_bytes,
+                       stats->send_burst_socket_error,
+                       loss_cnt,
+                       tlp_cnt);
+
+        if (ret < 0) {
+            break;
+        }
+
+        curr_size += ret;
+        if (curr_size >= buff_size) {
+            buff[buff_size - 1] = '\0';
+            break;
+        }
+    }
+}
+
 void 
 xqc_conn_get_stats_internal(xqc_connection_t *conn, xqc_conn_stats_t *conn_stats)
 {
@@ -3782,6 +3954,7 @@ xqc_conn_get_stats_internal(xqc_connection_t *conn, xqc_conn_stats_t *conn_stats
 
     /* 自定义信息 */
     xqc_conn_info_print(conn, conn_stats);
+    xqc_conn_send_availability_info_print(conn, conn_stats);
 
     xqc_extern_conn_info_print(conn, conn_stats);
 }

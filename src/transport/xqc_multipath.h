@@ -84,6 +84,23 @@ typedef enum {
     XQC_PATH_CLASS_PERF_CLASS_SIZE,
 } xqc_path_perf_class_t;
 
+typedef struct xqc_path_send_availability_stats_s {
+    uint64_t            scheduler_selected_pkts;
+    uint64_t            scheduler_selected_bytes;
+    uint64_t            scheduler_selected_cwnd_full;
+    uint64_t            send_burst_calls;
+    uint64_t            send_burst_requested_pkts;
+    uint64_t            send_burst_requested_bytes;
+    uint64_t            send_burst_sent_pkts;
+    uint64_t            send_burst_sent_bytes;
+    uint64_t            send_burst_partial;
+    uint64_t            send_burst_partial_unsent_pkts;
+    uint64_t            send_burst_eagain;
+    uint64_t            send_burst_eagain_requested_pkts;
+    uint64_t            send_burst_eagain_requested_bytes;
+    uint64_t            send_burst_socket_error;
+} xqc_path_send_availability_stats_t;
+
 /* path context */
 struct xqc_path_ctx_s {
 
@@ -133,6 +150,7 @@ struct xqc_path_ctx_s {
     xqc_list_head_t     path_schedule_buf[XQC_SEND_TYPE_N];
     uint32_t            path_schedule_bytes;
     xqc_list_head_t     path_reinj_tmp_buf;
+    xqc_path_send_availability_stats_t send_avail_stats;
 
     /* related structs */
     xqc_connection_t   *parent_conn;
@@ -263,5 +281,4 @@ double xqc_path_recent_loss_rate(xqc_path_ctx_t *path);
 double xqc_conn_recent_loss_rate(xqc_connection_t *conn);
 
 #endif /* XQC_MULTIPATH_H */
-
 

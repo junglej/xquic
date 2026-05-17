@@ -10,6 +10,7 @@
 #include <signal.h>
 #include <fcntl.h>
 #include <stdlib.h>
+#include <limits.h>
 #include <stdio.h>
 #include <time.h>
 #include <inttypes.h>
@@ -28,12 +29,25 @@
 #include <sys/socket.h>
 #include <sys/ioctl.h>
 #include <net/if.h>
+#include <netinet/in.h>
 #include <getopt.h>
+#ifdef __linux__
+#include <linux/udp.h>
+#endif
 #else
 #pragma comment(lib,"ws2_32.lib")
 #pragma comment(lib,"event.lib")
 #pragma comment(lib, "Iphlpapi.lib")
 #include "getopt.h"
+#endif
+
+#if !defined(XQC_SYS_WINDOWS)
+#ifndef UDP_SEGMENT
+#define UDP_SEGMENT 103
+#endif
+#ifndef SOL_UDP
+#define SOL_UDP IPPROTO_UDP
+#endif
 #endif
 
 extern long xqc_random(void);
@@ -61,6 +75,8 @@ printf_null(const char *format, ...)
 #define XQC_PACKET_TMP_BUF_LEN 1500
 #define MAX_BUF_SIZE (100*1024*1024)
 #define XQC_TEST_CLI_LARGE_STREAM_CHUNK_SIZE (16*1024*1024)
+#define XQC_TEST_CLI_UDP_GSO_MAX_SEGMENTS 64
+#define XQC_TEST_CLI_UDP_GSO_SENDMMSG_MAX_MSGS 128
 
 #define XQC_MAX_TOKEN_LEN 256
 
@@ -301,6 +317,12 @@ int g_enable_reinjection = 0;
 int g_verify_cert = 0;
 int g_verify_cert_allow_self_sign = 0;
 int g_enable_wifi_monitor = 0;
+int g_enable_wifi_monitor_debug = 0;
+int g_enable_transport_trace = 0;
+int g_enable_scheduler_trace = 0;
+int g_enable_send_trace = 0;
+int g_enable_stream_trace = 0;
+int g_enable_udp_gso = 0;
 int g_header_num = 6;
 int g_epoch = 0;
 int g_cur_epoch = 0;
@@ -605,6 +627,16 @@ xqc_test_cli_write_aux_line(int fd, const char *line)
     (void) write(fd, xqc_test_line_break, 1);
 }
 
+static int
+xqc_test_cli_aux_trace_requested(void)
+{
+    return g_enable_wifi_monitor
+           || g_enable_scheduler_trace
+           || g_enable_transport_trace
+           || g_enable_send_trace
+           || g_enable_stream_trace;
+}
+
 static void
 xqc_test_cli_open_aux_trace_files(client_ctx_t *c)
 {
@@ -614,19 +646,27 @@ xqc_test_cli_open_aux_trace_files(client_ctx_t *c)
 
     xqc_test_cli_build_aux_path(g_log_path, XQC_TEST_CLI_PATH_MAP_SUFFIX,
         c->path_map_path, sizeof(c->path_map_path));
-    xqc_test_cli_build_aux_path(g_log_path, XQC_TEST_CLI_SEND_TRACE_SUFFIX,
-        c->send_trace_path, sizeof(c->send_trace_path));
+    if (g_enable_send_trace) {
+        xqc_test_cli_build_aux_path(g_log_path, XQC_TEST_CLI_SEND_TRACE_SUFFIX,
+            c->send_trace_path, sizeof(c->send_trace_path));
+    }
     xqc_test_cli_build_aux_path(g_log_path, XQC_TEST_CLI_WIFI_STATE_SUFFIX,
         c->wifi_state_path, sizeof(c->wifi_state_path));
-    xqc_test_cli_build_aux_path(g_log_path, XQC_TEST_CLI_SCHED_TRACE_SUFFIX,
-        c->scheduler_trace_path, sizeof(c->scheduler_trace_path));
-    xqc_test_cli_build_aux_path(g_log_path, XQC_TEST_CLI_TRANSPORT_TRACE_SUFFIX,
-        c->transport_trace_path, sizeof(c->transport_trace_path));
+    if (g_enable_scheduler_trace) {
+        xqc_test_cli_build_aux_path(g_log_path, XQC_TEST_CLI_SCHED_TRACE_SUFFIX,
+            c->scheduler_trace_path, sizeof(c->scheduler_trace_path));
+    }
+    if (g_enable_transport_trace) {
+        xqc_test_cli_build_aux_path(g_log_path, XQC_TEST_CLI_TRANSPORT_TRACE_SUFFIX,
+            c->transport_trace_path, sizeof(c->transport_trace_path));
+    }
 
     c->path_map_fd = xqc_test_cli_open_aux_csv(c->path_map_path,
         "ts_us,conn,path_id,path_seq,ifname,ifindex,fd");
-    c->send_trace_fd = xqc_test_cli_open_aux_csv(c->send_trace_path,
-        "ts_us,conn,path_id,path_seq,ifname,ifindex,fd,len,quic_form,quic_type,quic_dcid,quic_pn_raw,quic_pn_len");
+    if (g_enable_send_trace) {
+        c->send_trace_fd = xqc_test_cli_open_aux_csv(c->send_trace_path,
+            "ts_us,conn,path_id,path_seq,ifname,ifindex,fd,len,quic_form,quic_type,quic_dcid,quic_pn_raw,quic_pn_len");
+    }
     c->wifi_state_fd = xqc_test_cli_open_aux_csv(c->wifi_state_path,
         "ts_us,conn,path_id,path_seq,ifname,ifindex,wifi_state,"
         "pi_degraded,p_long_gap,service_rate_bytes_per_us,last_gap_us,"
@@ -635,62 +675,66 @@ xqc_test_cli_open_aux_trace_files(client_ctx_t *c)
         "ewma_service_bytes,ewma_service_time_us,sample_count,"
         "last_update_ts_us,gtsd_calibrated,tail_p50_us,tail_p95_us,"
         "tail_ratio,tail_baseline,tail_excess,cusum_on,cusum_off");
-    c->scheduler_trace_fd = xqc_test_cli_open_aux_csv(c->scheduler_trace_path,
-        "ts_us,conn,scheduler,selected_path_id,selected_ifname,"
-        "selected_ifindex,selected_on_degraded,other_cleaner,path0_id,"
-        "path0_ifname,path0_ifindex,path0_srtt_us,path0_cwnd_bytes,"
-        "path0_bytes_in_flight,path0_can_send,path0_path_state,"
-        "path0_app_status,path0_wifi_state,path0_pi,path0_p_long_gap,"
-        "path0_last_gap_us,path0_service_rate_bytes_per_us,"
-        "path0_gtsd_calibrated,path0_tail_p50_us,path0_tail_p95_us,"
-        "path0_tail_ratio,path0_tail_baseline,path0_tail_excess,"
-        "path0_cusum_on,path0_cusum_off,path1_id,path1_ifname,"
-        "path1_ifindex,path1_srtt_us,path1_cwnd_bytes,"
-        "path1_bytes_in_flight,path1_can_send,path1_path_state,"
-        "path1_app_status,path1_wifi_state,path1_pi,path1_p_long_gap,"
-        "path1_last_gap_us,path1_service_rate_bytes_per_us,"
-        "path1_gtsd_calibrated,path1_tail_p50_us,path1_tail_p95_us,"
-        "path1_tail_ratio,path1_tail_baseline,path1_tail_excess,"
-        "path1_cusum_on,path1_cusum_off,decision_reason,risk_reason,"
-        "selected_pi,selected_tail_excess,selected_last_mac_rtt_us,"
-        "selected_ewma_mac_rtt_us,selected_ewma_gap_us,"
-        "selected_ewma_airtime_us,selected_ewma_service_bytes,"
-        "selected_service_rate_bytes_per_us,path0_last_mac_rtt_us,"
-        "path0_ewma_mac_rtt_us,path0_ewma_gap_us,path0_ewma_airtime_us,"
-        "path0_ewma_service_bytes,path1_last_mac_rtt_us,"
-        "path1_ewma_mac_rtt_us,path1_ewma_gap_us,path1_ewma_airtime_us,"
-        "path1_ewma_service_bytes,path0_scheduler_high_risk,"
-        "path0_scheduler_risk_reason,path1_scheduler_high_risk,"
-        "path1_scheduler_risk_reason,base_candidate_ifname,"
-        "admission_candidate_ifname,eta_clean_us,eta_risky_us,"
-        "arrival_skew_us,predicted_ofo_bytes,selected_service_bytes,"
-        "risky_service_bytes,selected_service_rate_bytes_per_us,"
-        "risky_service_rate_bytes_per_us,ofo_budget_bytes,arrival_debt_bytes,"
-        "risk_inflight_debt_bytes,risk_inflight_budget_bytes,"
-        "admission_allowed,service_admission_selected,admission_block_reason,"
-        "risky_cwnd_bytes,risky_inflight_bytes,risky_cc_headroom_bytes,"
-        "risky_latest_rtt_us,risky_rtt_age_us,risky_rtt_stale,"
-        "risky_reservoir_bytes,risky_reservoir_low_bytes,"
-        "risky_reservoir_high_bytes,risky_service_quantum_bytes,"
-        "risky_last_probe_at_us,risky_tail_budget_used_bytes,"
-        "selected_srtt_us,selected_latest_rtt_us,selected_rtt_age_us,"
-        "reservoir_admit_selected,recovery_probe_selected");
-    c->transport_trace_fd = xqc_test_cli_open_aux_csv(c->transport_trace_path,
-        "ts_us,conn,event,reason,path_id,path_ifname,stream_id,"
-        "stream_offset,stream_bytes,packet_size,po_cc_size,packet_number,"
-        "pkt_type,frame_types,send_type,schedule_bytes,"
-        "path_schedule_bytes_before,path_schedule_bytes_after,cwnd_bytes,"
-        "bytes_in_flight,pacing_rate_bytes_per_s,pacing_budget_bytes,"
-        "pacing_on,cwnd_allowed,pacing_allowed,cc_allowed,app_limited,"
-        "sample_type,sample_valid,acked_bytes,delivered_bytes,lost_pkts,"
-        "srtt_us,latest_rtt_us,bandwidth_bytes_per_s,"
-        "rate_sample_bytes_per_s");
-    if (g_transport == 1) {
+    if (g_enable_scheduler_trace) {
+        c->scheduler_trace_fd = xqc_test_cli_open_aux_csv(c->scheduler_trace_path,
+            "ts_us,conn,scheduler,selected_path_id,selected_ifname,"
+            "selected_ifindex,selected_on_degraded,other_cleaner,path0_id,"
+            "path0_ifname,path0_ifindex,path0_srtt_us,path0_cwnd_bytes,"
+            "path0_bytes_in_flight,path0_can_send,path0_path_state,"
+            "path0_app_status,path0_wifi_state,path0_pi,path0_p_long_gap,"
+            "path0_last_gap_us,path0_service_rate_bytes_per_us,"
+            "path0_gtsd_calibrated,path0_tail_p50_us,path0_tail_p95_us,"
+            "path0_tail_ratio,path0_tail_baseline,path0_tail_excess,"
+            "path0_cusum_on,path0_cusum_off,path1_id,path1_ifname,"
+            "path1_ifindex,path1_srtt_us,path1_cwnd_bytes,"
+            "path1_bytes_in_flight,path1_can_send,path1_path_state,"
+            "path1_app_status,path1_wifi_state,path1_pi,path1_p_long_gap,"
+            "path1_last_gap_us,path1_service_rate_bytes_per_us,"
+            "path1_gtsd_calibrated,path1_tail_p50_us,path1_tail_p95_us,"
+            "path1_tail_ratio,path1_tail_baseline,path1_tail_excess,"
+            "path1_cusum_on,path1_cusum_off,decision_reason,risk_reason,"
+            "selected_pi,selected_tail_excess,selected_last_mac_rtt_us,"
+            "selected_ewma_mac_rtt_us,selected_ewma_gap_us,"
+            "selected_ewma_airtime_us,selected_ewma_service_bytes,"
+            "selected_service_rate_bytes_per_us,path0_last_mac_rtt_us,"
+            "path0_ewma_mac_rtt_us,path0_ewma_gap_us,path0_ewma_airtime_us,"
+            "path0_ewma_service_bytes,path1_last_mac_rtt_us,"
+            "path1_ewma_mac_rtt_us,path1_ewma_gap_us,path1_ewma_airtime_us,"
+            "path1_ewma_service_bytes,path0_scheduler_high_risk,"
+            "path0_scheduler_risk_reason,path1_scheduler_high_risk,"
+            "path1_scheduler_risk_reason,base_candidate_ifname,"
+            "admission_candidate_ifname,eta_clean_us,eta_risky_us,"
+            "arrival_skew_us,predicted_ofo_bytes,selected_service_bytes,"
+            "risky_service_bytes,selected_service_rate_bytes_per_us,"
+            "risky_service_rate_bytes_per_us,ofo_budget_bytes,arrival_debt_bytes,"
+            "risk_inflight_debt_bytes,risk_inflight_budget_bytes,"
+            "admission_allowed,service_admission_selected,admission_block_reason,"
+            "risky_cwnd_bytes,risky_inflight_bytes,risky_cc_headroom_bytes,"
+            "risky_latest_rtt_us,risky_rtt_age_us,risky_rtt_stale,"
+            "risky_reservoir_bytes,risky_reservoir_low_bytes,"
+            "risky_reservoir_high_bytes,risky_service_quantum_bytes,"
+            "risky_last_probe_at_us,risky_tail_budget_used_bytes,"
+            "selected_srtt_us,selected_latest_rtt_us,selected_rtt_age_us,"
+            "reservoir_admit_selected,recovery_probe_selected");
+    }
+    if (g_enable_transport_trace) {
+        c->transport_trace_fd = xqc_test_cli_open_aux_csv(c->transport_trace_path,
+            "ts_us,conn,event,reason,path_id,path_ifname,stream_id,"
+            "stream_offset,stream_bytes,packet_size,po_cc_size,packet_number,"
+            "pkt_type,frame_types,send_type,schedule_bytes,"
+            "path_schedule_bytes_before,path_schedule_bytes_after,cwnd_bytes,"
+            "bytes_in_flight,pacing_rate_bytes_per_s,pacing_budget_bytes,"
+            "pacing_on,cwnd_allowed,pacing_allowed,cc_allowed,app_limited,"
+            "sample_type,sample_valid,acked_bytes,delivered_bytes,lost_pkts,"
+            "srtt_us,latest_rtt_us,bandwidth_bytes_per_s,"
+            "rate_sample_bytes_per_s");
+    }
+    if (g_enable_stream_trace && g_transport == 1) {
         xqc_test_cli_build_aux_path(g_log_path, XQC_TEST_CLI_STREAM_TRACE_SUFFIX,
             c->stream_trace_path, sizeof(c->stream_trace_path));
         c->stream_trace_fd = xqc_test_cli_open_aux_csv(c->stream_trace_path,
             "ts_us,conn,stream_id,event,notify_flag,io_bytes,elapsed_ms,send_offset,send_body_len,recv_body_len,header_recvd,recv_fin,stats_send_body_size,stats_recv_body_size,stats_stream_err,stats_mp_state,stats_retrans_cnt,stats_sent_pkt_cnt");
-    } else {
+    } else if (g_enable_stream_trace) {
         xqc_test_cli_build_aux_path(g_log_path, XQC_TEST_CLI_REQ_TRACE_SUFFIX,
             c->request_trace_path, sizeof(c->request_trace_path));
         c->request_trace_fd = xqc_test_cli_open_aux_csv(c->request_trace_path,
@@ -1051,6 +1095,94 @@ xqc_test_cli_wifi_state_update_cb(const xqc_wifi_state_snapshot_t *snapshot, voi
             path->path_id, snapshot);
     }
     xqc_test_cli_log_wifi_state_snapshot(c, path, snapshot);
+}
+
+static uint64_t
+xqc_test_cli_env_u64(const char *name, uint64_t default_value)
+{
+    const char *value = getenv(name);
+    char *end = NULL;
+    unsigned long long parsed;
+
+    if (value == NULL || value[0] == '\0') {
+        return default_value;
+    }
+
+    errno = 0;
+    parsed = strtoull(value, &end, 10);
+    if (errno != 0 || end == value || *end != '\0') {
+        printf("invalid %s:%s, use default:%"PRIu64"\n",
+               name, value, default_value);
+        return default_value;
+    }
+
+    return (uint64_t) parsed;
+}
+
+static void
+xqc_test_cli_seed_one_mac_aware_state(user_conn_t *user_conn,
+    uint64_t path_id, const char *ifname, unsigned int ifindex,
+    uint64_t sample_count, uint64_t service_bytes, uint64_t mac_rtt_us)
+{
+    xqc_wifi_state_snapshot_t snapshot;
+
+    if (user_conn == NULL || sample_count == 0) {
+        return;
+    }
+
+    memset(&snapshot, 0, sizeof(snapshot));
+    snapshot.ts_us = xqc_now();
+    snapshot.last_update_ts_us = snapshot.ts_us;
+    snapshot.state = XQC_WIFI_PATH_STATE_REGULAR;
+    snapshot.sample_count = sample_count;
+    snapshot.last_service_bytes = service_bytes;
+    snapshot.ewma_service_bytes = (double) service_bytes;
+    snapshot.last_mac_rtt_us = mac_rtt_us;
+    snapshot.ewma_mac_rtt_us = (double) mac_rtt_us;
+    snapshot.service_rate_bytes_per_us =
+        mac_rtt_us > 0 ? (double) service_bytes / (double) mac_rtt_us : 0.0;
+    snapshot.gtsd_calibrated = 1;
+    snapshot.ifindex = ifindex;
+    if (ifname != NULL && ifname[0] != '\0') {
+        snprintf(snapshot.ifname, sizeof(snapshot.ifname), "%s", ifname);
+    }
+
+    xqc_mac_aware_scheduler_update_path_state(user_conn, path_id, &snapshot);
+    printf("mac_aware test seed path:%"PRIu64" samples:%"PRIu64
+           " service_bytes:%"PRIu64" mac_rtt_us:%"PRIu64"\n",
+           path_id, sample_count, service_bytes, mac_rtt_us);
+}
+
+static void
+xqc_test_cli_seed_mac_aware_state(user_conn_t *user_conn)
+{
+    uint64_t sample_count = xqc_test_cli_env_u64(
+        "MAC_AWARE_TEST_SEED_SAMPLES", 0);
+    uint64_t service_bytes = xqc_test_cli_env_u64(
+        "MAC_AWARE_TEST_SERVICE_BYTES", 32768);
+    uint64_t mac_rtt_us = xqc_test_cli_env_u64(
+        "MAC_AWARE_TEST_MAC_RTT_US", 1000);
+    int seeded = 0;
+
+    if (sample_count == 0 || user_conn == NULL) {
+        return;
+    }
+
+    for (int i = 0; i < g_multi_interface_cnt; i++) {
+        if (!g_client_path[i].is_in_used) {
+            continue;
+        }
+        xqc_test_cli_seed_one_mac_aware_state(user_conn,
+            g_client_path[i].path_id, g_client_path[i].ifname,
+            g_client_path[i].ifindex, sample_count, service_bytes,
+            mac_rtt_us);
+        seeded = 1;
+    }
+
+    if (!seeded) {
+        xqc_test_cli_seed_one_mac_aware_state(user_conn, 0, NULL, 0,
+            sample_count, service_bytes, mac_rtt_us);
+    }
 }
 
 static void
@@ -1418,9 +1550,13 @@ xqc_test_cli_init_monitoring(client_ctx_t *c)
         return;
     }
 
-    xqc_scheduler_register_observer(xqc_test_cli_scheduler_observer_cb, c);
-    xqc_transport_trace_register_observer(
-        xqc_test_cli_transport_trace_observer_cb, c);
+    if (g_enable_scheduler_trace) {
+        xqc_scheduler_register_observer(xqc_test_cli_scheduler_observer_cb, c);
+    }
+    if (g_enable_transport_trace) {
+        xqc_transport_trace_register_observer(
+            xqc_test_cli_transport_trace_observer_cb, c);
+    }
     xqc_test_cli_resolve_monitor_paths(c);
 
 #ifndef XQC_SYS_WINDOWS
@@ -1435,6 +1571,7 @@ xqc_test_cli_init_monitoring(client_ctx_t *c)
     monitor_cfg.config_path = c->wifi_monitor_config_path;
     monitor_cfg.ifname_primary = g_multi_interface[0];
     monitor_cfg.ifname_secondary = g_multi_interface_cnt > 1 ? g_multi_interface[1] : NULL;
+    monitor_cfg.debug_packet_trace = g_enable_wifi_monitor_debug ? 1 : 0;
     monitor_cfg.state_update_cb = xqc_test_cli_wifi_state_update_cb;
     monitor_cfg.state_update_user_data = c;
 
@@ -1444,9 +1581,10 @@ xqc_test_cli_init_monitoring(client_ctx_t *c)
         return;
     }
 
-    printf("wifi monitor started, output_dir=%s config=%s if0=%s if1=%s\n",
+    printf("wifi monitor started, output_dir=%s config=%s debug_packet_trace=%d if0=%s if1=%s\n",
         c->wifi_monitor_output_dir,
         c->wifi_monitor_config_path,
+        monitor_cfg.debug_packet_trace,
         monitor_cfg.ifname_primary ? monitor_cfg.ifname_primary : "-",
         monitor_cfg.ifname_secondary ? monitor_cfg.ifname_secondary : "-");
 }
@@ -2365,9 +2503,10 @@ xqc_client_write_socket(const unsigned char *buf, size_t size,
 
         res = sendto(fd, send_buf, send_buf_size, 0, peer_addr, peer_addrlen);
         if (res < 0) {
-            printf("xqc_client_write_socket err %zd %s\n", res, strerror(get_sys_errno()));
             if (get_sys_errno() == EAGAIN) {
                 res = XQC_SOCKET_EAGAIN;
+            } else {
+                printf("xqc_client_write_socket err %zd %s\n", res, strerror(get_sys_errno()));
             }
             if (errno == EMSGSIZE) {
                 res = send_buf_size;
@@ -2623,10 +2762,10 @@ xqc_client_write_socket_ex(uint64_t path_id,
 
         res = sendto(fd, send_buf, send_buf_size, 0, peer_addr, peer_addrlen);
         if (res < 0) {
-            printf("xqc_client_write_socket_ex path:%"PRIu64" err %zd %s %zu\n", path_id, res, strerror(errno), send_buf_size);
             if (errno == EAGAIN) {
                 res = XQC_SOCKET_EAGAIN;
             } else {
+                printf("xqc_client_write_socket_ex path:%"PRIu64" err %zd %s %zu\n", path_id, res, strerror(errno), send_buf_size);
                 res = XQC_SOCKET_ERROR;
             }
             if (errno == EMSGSIZE) {
@@ -2686,6 +2825,221 @@ xqc_client_conn_closing_notify(xqc_connection_t *conn,
 
 
 #if defined(XQC_SUPPORT_SENDMMSG) && !defined(XQC_SYS_WINDOWS)
+static void
+xqc_client_set_udp_segment_cmsg(struct msghdr *msg, char *control,
+    size_t control_len, uint16_t gso_size)
+{
+    struct cmsghdr *cmsg;
+
+    memset(control, 0, control_len);
+    msg->msg_control = control;
+    msg->msg_controllen = control_len;
+
+    cmsg = CMSG_FIRSTHDR(msg);
+    cmsg->cmsg_level = SOL_UDP;
+    cmsg->cmsg_type = UDP_SEGMENT;
+    cmsg->cmsg_len = CMSG_LEN(sizeof(uint16_t));
+    memcpy(CMSG_DATA(cmsg), &gso_size, sizeof(gso_size));
+}
+
+static ssize_t
+xqc_client_send_iov_with_gso(int fd, const struct iovec *msg_iov,
+    unsigned int vlen, uint16_t gso_size)
+{
+    struct msghdr msg;
+    char control[CMSG_SPACE(sizeof(uint16_t))];
+
+    memset(&msg, 0, sizeof(msg));
+    msg.msg_iov = (struct iovec *) msg_iov;
+    msg.msg_iovlen = vlen;
+
+    if (gso_size > 0 && vlen > 1) {
+        xqc_client_set_udp_segment_cmsg(&msg, control, sizeof(control), gso_size);
+    }
+
+    return sendmsg(fd, &msg, 0);
+}
+
+static ssize_t
+xqc_client_write_gso_mmsg(int fd, xqc_user_path_t *path,
+    const struct iovec *msg_iov, unsigned int vlen)
+{
+    ssize_t res = 0;
+    unsigned int sent_cnt = 0;
+
+    errno = 0;
+    if (TEST_DROP) {
+        return vlen;
+    }
+
+    if (g_test_case == 5) { /* socket send fail */
+        g_test_case = -1;
+        errno = EAGAIN;
+        return XQC_SOCKET_EAGAIN;
+    }
+
+    while (sent_cnt < vlen) {
+        unsigned int group_cnt = 1;
+        size_t gso_size = msg_iov[sent_cnt].iov_len;
+
+        if (gso_size == 0 || gso_size > UINT16_MAX) {
+            errno = EMSGSIZE;
+            res = -1;
+            break;
+        }
+
+        while (sent_cnt + group_cnt < vlen
+               && group_cnt < XQC_TEST_CLI_UDP_GSO_MAX_SEGMENTS
+               && msg_iov[sent_cnt + group_cnt].iov_len == gso_size)
+        {
+            group_cnt++;
+        }
+
+        do {
+            errno = 0;
+            res = xqc_client_send_iov_with_gso(fd, &msg_iov[sent_cnt],
+                group_cnt, group_cnt > 1 ? (uint16_t) gso_size : 0);
+        } while (res < 0 && errno == EINTR);
+
+        if (res < 0) {
+            break;
+        }
+
+        if (path != NULL) {
+            unsigned int i;
+            for (i = 0; i < group_cnt; i++) {
+                xqc_test_cli_log_send_trace(path,
+                    (const unsigned char *) msg_iov[sent_cnt + i].iov_base,
+                    msg_iov[sent_cnt + i].iov_len);
+            }
+        }
+
+        sent_cnt += group_cnt;
+    }
+
+    if (res < 0) {
+        if (errno != EAGAIN) {
+            printf("udp_gso sendmsg err %zd %s sent_cnt:%u vlen:%u\n",
+                res, strerror(errno), sent_cnt, vlen);
+        }
+        if (errno == EAGAIN) {
+            return sent_cnt > 0 ? (ssize_t) sent_cnt : XQC_SOCKET_EAGAIN;
+        }
+        return sent_cnt > 0 ? (ssize_t) sent_cnt : XQC_SOCKET_ERROR;
+    }
+
+    return sent_cnt;
+}
+
+static ssize_t
+xqc_client_write_gso_sendmmsg(int fd, xqc_user_path_t *path,
+    const struct iovec *msg_iov, unsigned int vlen)
+{
+    struct mmsghdr mmsg[XQC_TEST_CLI_UDP_GSO_SENDMMSG_MAX_MSGS];
+    char control[XQC_TEST_CLI_UDP_GSO_SENDMMSG_MAX_MSGS][CMSG_SPACE(sizeof(uint16_t))];
+    unsigned int seg_offsets[XQC_TEST_CLI_UDP_GSO_SENDMMSG_MAX_MSGS];
+    unsigned int seg_counts[XQC_TEST_CLI_UDP_GSO_SENDMMSG_MAX_MSGS];
+    unsigned int total_sent = 0;
+    ssize_t res = 0;
+
+    errno = 0;
+    if (TEST_DROP) {
+        return vlen;
+    }
+
+    if (g_test_case == 5) { /* socket send fail */
+        g_test_case = -1;
+        errno = EAGAIN;
+        return XQC_SOCKET_EAGAIN;
+    }
+
+    while (total_sent < vlen) {
+        unsigned int msg_cnt = 0;
+        unsigned int next_seg = total_sent;
+
+        memset(mmsg, 0, sizeof(mmsg));
+
+        while (next_seg < vlen
+               && msg_cnt < XQC_TEST_CLI_UDP_GSO_SENDMMSG_MAX_MSGS)
+        {
+            unsigned int group_cnt = 1;
+            size_t gso_size = msg_iov[next_seg].iov_len;
+
+            if (gso_size == 0 || gso_size > UINT16_MAX) {
+                errno = EMSGSIZE;
+                res = -1;
+                break;
+            }
+
+            while (next_seg + group_cnt < vlen
+                   && group_cnt < XQC_TEST_CLI_UDP_GSO_MAX_SEGMENTS
+                   && msg_iov[next_seg + group_cnt].iov_len == gso_size)
+            {
+                group_cnt++;
+            }
+
+            mmsg[msg_cnt].msg_hdr.msg_iov = (struct iovec *) &msg_iov[next_seg];
+            mmsg[msg_cnt].msg_hdr.msg_iovlen = group_cnt;
+            if (group_cnt > 1) {
+                xqc_client_set_udp_segment_cmsg(&mmsg[msg_cnt].msg_hdr,
+                    control[msg_cnt], sizeof(control[msg_cnt]), (uint16_t) gso_size);
+            }
+            seg_offsets[msg_cnt] = next_seg;
+            seg_counts[msg_cnt] = group_cnt;
+
+            next_seg += group_cnt;
+            msg_cnt++;
+        }
+
+        if (res < 0) {
+            break;
+        }
+
+        do {
+            errno = 0;
+            res = sendmmsg(fd, mmsg, msg_cnt, 0);
+        } while (res < 0 && errno == EINTR);
+
+        if (res < 0) {
+            break;
+        }
+
+        if (path != NULL) {
+            int i;
+            for (i = 0; i < res; i++) {
+                unsigned int j;
+                for (j = 0; j < seg_counts[i]; j++) {
+                    unsigned int seg_idx = seg_offsets[i] + j;
+                    xqc_test_cli_log_send_trace(path,
+                        (const unsigned char *) msg_iov[seg_idx].iov_base,
+                        msg_iov[seg_idx].iov_len);
+                }
+            }
+        }
+
+        for (int i = 0; i < res; i++) {
+            total_sent += seg_counts[i];
+        }
+
+        if ((unsigned int) res < msg_cnt) {
+            return total_sent;
+        }
+    }
+
+    if (res < 0) {
+        if (errno != EAGAIN) {
+            printf("udp_gso sendmmsg err %zd %s sent_cnt:%u vlen:%u\n",
+                res, strerror(errno), total_sent, vlen);
+        }
+        if (errno == EAGAIN) {
+            return total_sent > 0 ? (ssize_t) total_sent : XQC_SOCKET_EAGAIN;
+        }
+        return total_sent > 0 ? (ssize_t) total_sent : XQC_SOCKET_ERROR;
+    }
+
+    return total_sent;
+}
+
 ssize_t 
 xqc_client_write_mmsg(const struct iovec *msg_iov, unsigned int vlen,
     const struct sockaddr *peer_addr, socklen_t peer_addrlen, void *user)
@@ -2696,6 +3050,12 @@ xqc_client_write_mmsg(const struct iovec *msg_iov, unsigned int vlen,
     int fd = user_conn->fd;
     xqc_user_path_t *path = xqc_test_cli_find_path_by_fd(fd);
     struct mmsghdr mmsg[MAX_SEG];
+    if (g_enable_udp_gso && g_test_case == 20) {
+        return xqc_client_write_gso_sendmmsg(fd, path, msg_iov, vlen);
+    }
+    if (g_enable_udp_gso) {
+        return xqc_client_write_gso_mmsg(fd, path, msg_iov, vlen);
+    }
     memset(&mmsg, 0, sizeof(mmsg));
     for (int i = 0; i < vlen; i++) {
         mmsg[i].msg_hdr.msg_iov = (struct iovec *)&msg_iov[i];
@@ -2713,9 +3073,10 @@ xqc_client_write_mmsg(const struct iovec *msg_iov, unsigned int vlen,
 
         res = sendmmsg(fd, mmsg, vlen, 0);
         if (res < 0) {
-            printf("sendmmsg err %zd %s\n", res, strerror(errno));
             if (errno == EAGAIN) {
                 res = XQC_SOCKET_EAGAIN;
+            } else {
+                printf("sendmmsg err %zd %s\n", res, strerror(errno));
             }
         } else if (path != NULL) {
             int i;
@@ -2753,6 +3114,12 @@ xqc_client_mp_write_mmsg(uint64_t path_id,
     }
 
     struct mmsghdr mmsg[MAX_SEG];
+    if (g_enable_udp_gso && g_test_case == 20) {
+        return xqc_client_write_gso_sendmmsg(fd, path, msg_iov, vlen);
+    }
+    if (g_enable_udp_gso) {
+        return xqc_client_write_gso_mmsg(fd, path, msg_iov, vlen);
+    }
     memset(&mmsg, 0, sizeof(mmsg));
     for (int i = 0; i < vlen; i++) {
         mmsg[i].msg_hdr.msg_iov = (struct iovec *)&msg_iov[i];
@@ -2770,9 +3137,10 @@ xqc_client_mp_write_mmsg(uint64_t path_id,
 
         res = sendmmsg(fd, mmsg, vlen, 0);
         if (res < 0) {
-            printf("sendmmsg err %zd %s\n", res, strerror(errno));
             if (errno == EAGAIN) {
                 res = XQC_SOCKET_EAGAIN;
+            } else {
+                printf("sendmmsg err %zd %s\n", res, strerror(errno));
             }
         } else if (path != NULL) {
             int i;
@@ -2807,11 +3175,43 @@ xqc_client_bind_to_interface(int fd, const char *interface_name)
     return XQC_OK;
 }
 
+static int
+xqc_client_env_socket_buffer_bytes(const char *name, int default_value)
+{
+    const char *value = getenv(name);
+    if (value == NULL || value[0] == '\0') {
+        return default_value;
+    }
+
+    errno = 0;
+    char *end = NULL;
+    unsigned long long parsed = strtoull(value, &end, 10);
+    if (errno != 0 || end == value || *end != '\0' || parsed > INT_MAX) {
+        printf("invalid %s:%s, use default:%d\n", name, value, default_value);
+        return default_value;
+    }
+    if (parsed == 0) {
+        return default_value;
+    }
+    return (int) parsed;
+}
+
+static void
+xqc_client_print_socket_buffer(int fd, int optname, const char *label, int requested)
+{
+    int actual = 0;
+    socklen_t actual_len = sizeof(actual);
+    if (getsockopt(fd, SOL_SOCKET, optname, &actual, &actual_len) == 0) {
+        printf("socket buffer %s requested:%d actual:%d\n", label, requested, actual);
+    }
+}
+
 static int 
 xqc_client_create_socket(int type, 
     const struct sockaddr *saddr, socklen_t saddr_len, char *interface_type)
 {
-    int size;
+    int rcvbuf_size;
+    int sndbuf_size;
     int fd = -1;
     int flags;
 
@@ -2833,16 +3233,19 @@ xqc_client_create_socket(int type,
     }
 #endif
 
-    size = 1 * 1024 * 1024;
-    if (setsockopt(fd, SOL_SOCKET, SO_RCVBUF, &size, sizeof(int)) < 0) {
+    rcvbuf_size = xqc_client_env_socket_buffer_bytes("XQUIC_TEST_SOCKET_RCVBUF_BYTES", 1 * 1024 * 1024);
+    sndbuf_size = xqc_client_env_socket_buffer_bytes("XQUIC_TEST_SOCKET_SNDBUF_BYTES", 1 * 1024 * 1024);
+    if (setsockopt(fd, SOL_SOCKET, SO_RCVBUF, &rcvbuf_size, sizeof(int)) < 0) {
         printf("setsockopt failed, errno: %d\n", get_sys_errno());
         goto err;
     }
 
-    if (setsockopt(fd, SOL_SOCKET, SO_SNDBUF, &size, sizeof(int)) < 0) {
+    if (setsockopt(fd, SOL_SOCKET, SO_SNDBUF, &sndbuf_size, sizeof(int)) < 0) {
         printf("setsockopt failed, errno: %d\n", get_sys_errno());
         goto err;
     }
+    xqc_client_print_socket_buffer(fd, SO_RCVBUF, "SO_RCVBUF", rcvbuf_size);
+    xqc_client_print_socket_buffer(fd, SO_SNDBUF, "SO_SNDBUF", sndbuf_size);
 
 #if !defined(__APPLE__)
     int val = IP_PMTUDISC_DO;
@@ -3165,6 +3568,9 @@ xqc_client_conn_close_notify(xqc_connection_t *conn, const xqc_cid_t *cid, void 
            stats.send_count, stats.lost_count, stats.tlp_count, stats.recv_count, stats.srtt, stats.early_data_flag, stats.conn_err, stats.mp_state, stats.ack_info, stats.alpn);
 
     printf("conn_info: \"%s\"\n", stats.conn_info);
+    if (stats.send_availability_info[0] != '\0') {
+        printf("send_availability_info: \"%s\"\n", stats.send_availability_info);
+    }
 
     if (!g_test_qch_mode) {
         printf("[dgram]|recv_dgram_bytes:%zu|sent_dgram_bytes:%zu|lost_dgram_bytes:%zu|lost_cnt:%zu|\n", 
@@ -3284,6 +3690,9 @@ xqc_client_h3_conn_close_notify(xqc_h3_conn_t *conn, const xqc_cid_t *cid, void 
     xqc_conn_stats_t stats = xqc_conn_get_stats(p_ctx->engine, cid);
     printf("send_count:%u, lost_count:%u, tlp_count:%u, recv_count:%u, srtt:%"PRIu64" early_data_flag:%d, conn_err:%d, mp_state:%d, ack_info:%s, alpn:%s, conn_info:%s\n",
            stats.send_count, stats.lost_count, stats.tlp_count, stats.recv_count, stats.srtt, stats.early_data_flag, stats.conn_err, stats.mp_state, stats.ack_info, stats.alpn, stats.conn_info);
+    if (stats.send_availability_info[0] != '\0') {
+        printf("send_availability_info: \"%s\"\n", stats.send_availability_info);
+    }
 
     if (!g_test_qch_mode) {
         printf("[h3-dgram]|recv_dgram_bytes:%zu|sent_dgram_bytes:%zu|lost_dgram_bytes:%zu|lost_cnt:%zu|\n", 
@@ -3389,7 +3798,9 @@ xqc_client_stream_send(xqc_stream_t *stream, void *user_data)
     static int send_cnt = 0;
     size_t send_len;
     unsigned char *send_buf;
-    printf("|xqc_client_stream_send|cnt:%d|\n", ++send_cnt);
+    if (g_enable_stream_trace) {
+        printf("|xqc_client_stream_send|cnt:%d|\n", ++send_cnt);
+    }
 
     if (g_test_case == 99) {
         xqc_stream_send(stream, NULL, 0, 1);
@@ -3425,12 +3836,16 @@ xqc_client_stream_send(xqc_stream_t *stream, void *user_data)
 
         ret = xqc_stream_send(stream, send_buf, send_len, fin);
         if (ret < 0) {
-            printf("xqc_stream_send error %zd\n", ret);
+            if (g_enable_stream_trace || ret != -XQC_EAGAIN) {
+                printf("xqc_stream_send error %zd\n", ret);
+            }
             return 0;
 
         } else {
             user_stream->send_offset += ret;
-            printf("xqc_stream_send offset=%"PRIu64"\n", user_stream->send_offset);
+            if (g_enable_stream_trace) {
+                printf("xqc_stream_send offset=%"PRIu64"\n", user_stream->send_offset);
+            }
         }
     }
 
@@ -3439,7 +3854,9 @@ xqc_client_stream_send(xqc_stream_t *stream, void *user_data)
             fin = 1;
             usleep(200*1000);
             ret = xqc_stream_send(stream, NULL, 0, fin);
-            printf("xqc_stream_send sent:%zd, offset=%"PRIu64", fin=1\n", ret, user_stream->send_offset);
+            if (g_enable_stream_trace) {
+                printf("xqc_stream_send sent:%zd, offset=%"PRIu64", fin=1\n", ret, user_stream->send_offset);
+            }
         }
     }
 
@@ -3450,7 +3867,9 @@ int
 xqc_client_stream_write_notify(xqc_stream_t *stream, void *user_data)
 {
     static int write_notify_cnt = 0;
-    printf("|xqc_client_stream_write_notify|cnt:%d|\n", ++write_notify_cnt);
+    if (g_enable_stream_trace) {
+        printf("|xqc_client_stream_write_notify|cnt:%d|\n", ++write_notify_cnt);
+    }
 
     //DEBUG;
     int ret = 0;
@@ -5530,9 +5949,12 @@ void usage(int argc, char *argv[]) {
 "   -z    periodically send request.\n"
 "   -S    request per second.\n"
 "   --scheduler             Multipath scheduler: minrtt|backup|rap|macrtt_rap|musher|rr|roundrobin|red|redundant|mac_aware|xlink|blest|interop|backup_fec.\n"
-"   --wifi-monitor          Enable transport Wi-Fi monitor and CSV traces.\n"
+"   --wifi-monitor          Enable low-overhead transport Wi-Fi state monitor.\n"
+"   --wifi-monitor-debug    Also enable per-packet Wi-Fi monitor CSV traces.\n"
 "   --wifi-monitor-out      Output directory for eBPF Wi-Fi artifacts.\n"
 "   --wifi-monitor-config   Config path for the Wi-Fi monitor runtime.\n"
+"   --stream-trace         Enable test client stream/request trace CSV.\n"
+"   --udp-gso               Enable Linux UDP_SEGMENT GSO for batched QUIC sends.\n"
 , prog);
 }
 
@@ -5642,6 +6064,12 @@ int main(int argc, char *argv[]) {
         {"wifi-monitor", no_argument, &long_opt_index, 16},
         {"wifi-monitor-out", required_argument, &long_opt_index, 17},
         {"wifi-monitor-config", required_argument, &long_opt_index, 18},
+        {"transport-trace", no_argument, &long_opt_index, 19},
+        {"scheduler-trace", no_argument, &long_opt_index, 20},
+        {"send-trace", no_argument, &long_opt_index, 21},
+        {"wifi-monitor-debug", no_argument, &long_opt_index, 22},
+        {"udp-gso", no_argument, &long_opt_index, 23},
+        {"stream-trace", no_argument, &long_opt_index, 24},
         {0, 0, 0, 0}
     };
 
@@ -5978,6 +6406,37 @@ int main(int argc, char *argv[]) {
                 printf("option wifi monitor config:%s\n", g_wifi_monitor_config_path);
                 break;
 
+            case 19:
+                g_enable_transport_trace = 1;
+                printf("option enable transport-trace:on\n");
+                break;
+
+            case 20:
+                g_enable_scheduler_trace = 1;
+                printf("option enable scheduler-trace:on\n");
+                break;
+
+            case 21:
+                g_enable_send_trace = 1;
+                printf("option enable send-trace:on\n");
+                break;
+
+            case 22:
+                g_enable_wifi_monitor = 1;
+                g_enable_wifi_monitor_debug = 1;
+                printf("option enable wifi monitor packet debug:on\n");
+                break;
+
+            case 23:
+                g_enable_udp_gso = 1;
+                printf("option enable udp-gso:on\n");
+                break;
+
+            case 24:
+                g_enable_stream_trace = 1;
+                printf("option enable stream-trace:on\n");
+                break;
+
             default:
                 break;
             }
@@ -6245,8 +6704,10 @@ int main(int argc, char *argv[]) {
     }
 
 #if defined(XQC_SUPPORT_SENDMMSG) && !defined(XQC_SYS_WINDOWS)
-    if (g_test_case == 20) { /* test sendmmsg */
-        printf("test sendmmsg!\n");
+    if (g_test_case == 20 || g_enable_udp_gso) { /* test batched send */
+        printf("%s\n",
+            g_enable_udp_gso && g_test_case == 20 ? "test udp gso + sendmmsg!" :
+            (g_enable_udp_gso ? "test udp gso!" : "test sendmmsg!"));
         tcbs.write_mmsg = xqc_client_write_mmsg;
         tcbs.write_mmsg_ex = xqc_client_mp_write_mmsg;
         config.sendmmsg_on = 1;
@@ -6364,7 +6825,7 @@ int main(int argc, char *argv[]) {
         return ret;
     }
 
-    if (g_enable_wifi_monitor) {
+    if (xqc_test_cli_aux_trace_requested()) {
         xqc_test_cli_open_aux_trace_files(&ctx);
         xqc_test_cli_init_monitoring(&ctx);
     }
@@ -6580,6 +7041,8 @@ int main(int argc, char *argv[]) {
             return -1;
         }
     }
+
+    xqc_test_cli_seed_mac_aware_state(user_conn);
 
    if (g_token_len > 0) {
         user_conn->token = g_token;
@@ -6799,7 +7262,7 @@ skip_data:
 
 cleanup_main:
     g_stop_event_base = NULL;
-    if (g_enable_wifi_monitor) {
+    if (xqc_test_cli_aux_trace_requested()) {
         xqc_test_cli_shutdown_monitoring(&ctx);
         xqc_test_cli_close_aux_trace_files(&ctx);
     }
