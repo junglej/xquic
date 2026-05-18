@@ -20,18 +20,18 @@
 
 #define XQC_MAC_AWARE_DEFAULT_BURST_K 2.0
 #define XQC_MAC_AWARE_DEFAULT_MIN_BURST_BYTES 12000ULL
-#define XQC_MAC_AWARE_DEFAULT_MAX_BURST_BYTES 49152ULL
-#define XQC_MAC_AWARE_DEFAULT_BOOTSTRAP_BURST_BYTES 12000ULL
+#define XQC_MAC_AWARE_DEFAULT_MAX_BURST_BYTES 262144ULL
+#define XQC_MAC_AWARE_DEFAULT_BOOTSTRAP_BURST_BYTES 49152ULL
 #define XQC_MAC_AWARE_DEFAULT_MIN_MAC_SAMPLES 8ULL
 #define XQC_MAC_AWARE_DEFAULT_SERVICE_QUANTUM_CAP_BYTES 262144ULL
-#define XQC_MAC_AWARE_DEFAULT_OFO_BUDGET_BYTES 1048576ULL
+#define XQC_MAC_AWARE_DEFAULT_OFO_BUDGET_BYTES 1073741824ULL
 #define XQC_MAC_AWARE_DEFAULT_RQ_LOW_FACTOR 1.0
 #define XQC_MAC_AWARE_DEFAULT_RQ_HIGH_FACTOR 2.0
 #define XQC_MAC_AWARE_OFFSET_OWNER_SLOTS 16
-#define XQC_MAC_AWARE_DEFAULT_OFFSET_OWNER 0
+#define XQC_MAC_AWARE_DEFAULT_OFFSET_OWNER 1
 #define XQC_MAC_AWARE_DEFAULT_STREAM_PLANNER 0
-#define XQC_MAC_AWARE_DEFAULT_OFFSET_CHUNK_BYTES 49152ULL
-#define XQC_MAC_AWARE_DEFAULT_OFFSET_MAX_CHUNK_BYTES 262144ULL
+#define XQC_MAC_AWARE_DEFAULT_OFFSET_CHUNK_BYTES 262144ULL
+#define XQC_MAC_AWARE_DEFAULT_OFFSET_MAX_CHUNK_BYTES 1048576ULL
 #define XQC_MAC_AWARE_DEFAULT_RECOVERY_PROBE_INTERVAL_US 100000ULL
 #define XQC_MAC_AWARE_DEFAULT_MAINT_PROBE_INTERVAL_US 500000ULL
 #define XQC_MAC_AWARE_DEFAULT_RECOVERY_PROMOTE_SAMPLES 3ULL
@@ -2276,6 +2276,41 @@ xqc_mac_aware_select_candidate_v2(xqc_mac_aware_scheduler_t *ctx,
         return selected;
     }
 
+    /* Clean-condition balanced mode: when no path shows degradation,
+     * bypass primary/probe and use the balanced v1 selector to keep
+     * both paths active for aggregation throughput. */
+    {
+        uint8_t j;
+        xqc_bool_t any_risk = XQC_FALSE;
+
+        for (j = 0; j < candidate_count; j++) {
+            if (candidates[j].path != NULL
+                && candidates[j].sample_count >= config->min_mac_samples
+                && xqc_mac_aware_candidate_high_risk(&candidates[j], config))
+            {
+                any_risk = XQC_TRUE;
+                break;
+            }
+        }
+        if (!any_risk) {
+            if (ctx != NULL) {
+                ctx->has_primary_path = 0;
+                ctx->primary_path_id = 0;
+            }
+            selected = xqc_mac_aware_select_candidate(candidates,
+                candidate_count, config, decision_reason);
+            if (selected != NULL && selected->path != NULL) {
+                if (decision_reason != NULL) {
+                    *decision_reason = "balanced";
+                }
+                if (base_candidate != NULL) {
+                    *base_candidate = selected;
+                }
+            }
+            return selected;
+        }
+    }
+
     if (ctx != NULL && ctx->has_primary_path) {
         primary_idx = xqc_mac_aware_find_candidate(candidates,
             candidate_count, ctx->primary_path_id);
@@ -2395,7 +2430,8 @@ xqc_mac_aware_scheduler_note_primary(xqc_mac_aware_scheduler_t *ctx,
             && strcmp(decision_reason, "recovery_promote") == 0))
     {
         if (decision_reason != NULL
-            && strcmp(decision_reason, "active_explore") == 0)
+            && (strcmp(decision_reason, "active_explore") == 0
+                || strcmp(decision_reason, "balanced") == 0))
         {
             return;
         }
