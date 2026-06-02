@@ -1,180 +1,522 @@
 /**
  * @copyright Copyright (c) 2022, Alibaba Group Holding Limited
- * 
- * CUBIC based on https://tools.ietf.org/html/rfc8312
+ *
+ * CUBIC based on RFC 8312.
+ *
+ * This is a C-port of Meta mvfst QuicCubic default semantics (MIT License),
+ * using XQUIC's congestion-control callback interface. Source reference:
+ * facebook/mvfst QuicCubic at commit 8b9c11029dfad67f33335c919d092c718bc0f6cd.
  */
 
 #include "src/congestion_control/xqc_cubic.h"
 #include "src/common/xqc_config.h"
 #include <math.h>
 
-#define XQC_CUBIC_FAST_CONVERGENCE  1
-#define XQC_CUBIC_MSS               XQC_MSS
-#define XQC_CUBIC_BETA              718     /* 718/1024=0.7 */
-#define XQC_CUBIC_BETA_SCALE        1024
-#define XQC_CUBIC_C                 410     /* 410/1024=0.4 */
-#define XQC_CUBE_SCALE              40u     /* 2^40=1024 * 1024^3 */
-#define XQC_CUBIC_TIME_SCALE        10u
-#define XQC_CUBIC_MAX_SSTHRESH      0xFFFFFFFF
+#define XQC_CUBIC_MSS                         XQC_MSS
+#define XQC_CUBIC_INIT_CWND_MSS               10
+#define XQC_CUBIC_MIN_CWND_MSS                2
+#define XQC_CUBIC_MAX_CWND_MSS                2000
+#define XQC_CUBIC_MAX_SSTHRESH                XQC_MAX_UINT64_VALUE
 
-#define XQC_CUBIC_MIN_WIN           (4 * XQC_CUBIC_MSS)
-#define XQC_CUBIC_MAX_MIN_WIN       (16 * XQC_CUBIC_MSS)
-#define XQC_CUBIC_MAX_INIT_WIN      (100 * XQC_CUBIC_MSS)
-#define XQC_CUBIC_INIT_WIN          (32 * XQC_CUBIC_MSS)
+#define XQC_CUBIC_HYSTART_ACKS                8
+#define XQC_CUBIC_HYSTART_LOW_CWND_MSS        16
+#define XQC_CUBIC_HYSTART_ACK_TRAIN_GAP       2
+#define XQC_CUBIC_HYSTART_DELAY_MIN           4000
+#define XQC_CUBIC_HYSTART_DELAY_MAX           16000
 
-const static uint64_t xqc_cube_factor =
-    (1ull << XQC_CUBE_SCALE) / XQC_CUBIC_C / XQC_CUBIC_MSS;
+#define XQC_CUBIC_TIME_SCALING_FACTOR         0.4
+#define XQC_CUBIC_REDUCTION_FACTOR            0.7
+#define XQC_CUBIC_LAST_MAX_REDUCTION_FACTOR   0.85
+#define XQC_CUBIC_TCP_FRIENDLY_FACTOR         \
+    (3.0 * (1.0 - XQC_CUBIC_REDUCTION_FACTOR) / (1.0 + XQC_CUBIC_REDUCTION_FACTOR))
 
-/*
- * Compute congestion window to use.
- * W_cubic(t) = C*(t-K)^3 + W_max (Eq. 1)
- * K = cubic_root(W_max*(1-beta_cubic)/C) (Eq. 2)
- * t: the time difference between the current time and the last window reduction
- * K: the time period for the function to grow from W to Wmax
- * C: window growth factor
- * beta: window reduction factor
- */
-static void
-xqc_cubic_update(void *cong_ctl, uint32_t acked_bytes, xqc_usec_t now)
+#define XQC_CUBIC_PACING_GAIN_STEADY          100
+#define XQC_CUBIC_PACING_GAIN_HYSTART         200
+#define XQC_CUBIC_PACING_GAIN_RECOVERY        125
+
+#define XQC_CUBIC_MVFST_SEMANTICS              "mvfst_default"
+#define XQC_CUBIC_MVFST_SOURCE_COMMIT          "8b9c11029dfad67f33335c919d092c718bc0f6cd"
+#define XQC_CUBIC_MVFST_ONLY_GROW_WHEN_LIMITED 0
+#define XQC_CUBIC_MVFST_ENABLE_ACK_TRAIN       0
+#define XQC_CUBIC_MVFST_ADDITIVE_AFTER_HYSTART 0
+#define XQC_CUBIC_MVFST_TCP_FRIENDLY           1
+
+const char *
+xqc_cubic_semantics(void)
 {
-    xqc_cubic_t    *cubic = (xqc_cubic_t *)(cong_ctl);
-    uint64_t        t;      /* unit: ms */
-    uint64_t        offs;   /* offs = |t - K| */
-    uint64_t        delta, bic_target;  /* delta = C*(t-K)^3 */
+    return XQC_CUBIC_MVFST_SEMANTICS
+           "|source=facebook/mvfst@"
+           XQC_CUBIC_MVFST_SOURCE_COMMIT
+           "|tcp_friendly=1"
+           "|ack_train=0"
+           "|additive_after_hystart=0"
+           "|only_grow_when_limited=0";
+}
 
-    /* First ACK after a loss event. */
-    if (cubic->epoch_start == 0) {
-        cubic->epoch_start = now;
+static uint64_t
+xqc_cubic_bound_cwnd(xqc_cubic_t *cubic, uint64_t cwnd)
+{
+    cwnd = xqc_max(cwnd, cubic->min_cwnd);
+    cwnd = xqc_min(cwnd, cubic->max_cwnd);
+    return cwnd;
+}
 
-        /* take max(last_max_cwnd, cwnd) as current Wmax origin point */
-        if (cubic->cwnd >= cubic->last_max_cwnd) {
-            /* exceed origin point, use cwnd as the new point */
-            cubic->bic_K = 0;
-            cubic->bic_origin_point = cubic->cwnd;
 
-        } else {
-            /*
-             * K = cubic_root(W_max*(1-beta_cubic)/C) = cubic_root((W_max-cwnd)/C)
-             * cube_factor = (1ull << XQC_CUBE_SCALE) / XQC_CUBIC_C / XQC_MSS
-             *             = 2^40 / (410 * MSS) = 2^30 / (410/1024*MSS)
-             *             = 2^30 / (C*MSS)
-             */
-            cubic->bic_K = cbrt(xqc_cube_factor * (cubic->last_max_cwnd - cubic->cwnd));
-            cubic->bic_origin_point = cubic->last_max_cwnd;
+static void
+xqc_cubic_reset_hystart(xqc_cubic_t *cubic)
+{
+    cubic->hystart_in_round = 0;
+    cubic->hystart_found = XQC_CUBIC_HYSTART_FOUND_NO;
+    cubic->hystart_round_start = 0;
+    cubic->hystart_last_jiffy = 0;
+    cubic->hystart_curr_sampled_rtt = 0;
+    cubic->hystart_last_sampled_rtt = 0;
+    cubic->hystart_delay_min = 0;
+    cubic->hystart_round_end_time = 0;
+    cubic->hystart_curr_sampled_rtt_valid = 0;
+    cubic->hystart_last_sampled_rtt_valid = 0;
+    cubic->hystart_delay_min_valid = 0;
+    cubic->hystart_ack_count = 0;
+}
+
+
+static void
+xqc_cubic_start_hystart_round(xqc_cubic_t *cubic, xqc_usec_t now)
+{
+    cubic->hystart_round_start = now;
+    cubic->hystart_last_jiffy = now;
+    cubic->hystart_ack_count = 0;
+
+    cubic->hystart_last_sampled_rtt = cubic->hystart_curr_sampled_rtt;
+    cubic->hystart_last_sampled_rtt_valid =
+        cubic->hystart_curr_sampled_rtt_valid;
+    cubic->hystart_curr_sampled_rtt = 0;
+    cubic->hystart_curr_sampled_rtt_valid = 0;
+
+    cubic->hystart_round_end_time = now;
+    cubic->hystart_in_round = 1;
+    cubic->hystart_found = XQC_CUBIC_HYSTART_FOUND_NO;
+}
+
+
+static xqc_usec_t
+xqc_cubic_hystart_delay_threshold(xqc_usec_t last_sampled_rtt)
+{
+    xqc_usec_t eta = last_sampled_rtt >> 4;
+    eta = xqc_max(eta, XQC_CUBIC_HYSTART_DELAY_MIN);
+    eta = xqc_min(eta, XQC_CUBIC_HYSTART_DELAY_MAX);
+    return eta;
+}
+
+
+static void
+xqc_cubic_enter_steady_from_hystart(xqc_cubic_t *cubic)
+{
+    cubic->hystart_in_round = 0;
+    cubic->hystart_curr_sampled_rtt_valid = 0;
+
+    if (!cubic->steady_additive_after_hystart) {
+        cubic->ssthresh = cubic->cwnd;
+    }
+
+    cubic->steady_last_max_cwnd_valid = 0;
+    cubic->steady_last_reduction_time_valid = 0;
+    cubic->steady_origin_point_valid = 0;
+    cubic->quiescence_start_valid = 0;
+    cubic->state = XQC_CUBIC_STATE_STEADY;
+}
+
+
+static xqc_bool_t
+xqc_cubic_hystart_maybe_exit(xqc_cubic_t *cubic)
+{
+    uint64_t low_ssthresh = XQC_CUBIC_HYSTART_LOW_CWND_MSS * XQC_CUBIC_MSS;
+
+    if (cubic->cwnd >= cubic->ssthresh) {
+        xqc_cubic_enter_steady_from_hystart(cubic);
+        return XQC_TRUE;
+    }
+
+    if (cubic->hystart_found != XQC_CUBIC_HYSTART_FOUND_NO
+        && cubic->cwnd >= low_ssthresh)
+    {
+        xqc_cubic_enter_steady_from_hystart(cubic);
+        return XQC_TRUE;
+    }
+
+    return XQC_FALSE;
+}
+
+
+static void
+xqc_cubic_update_time_to_origin(xqc_cubic_t *cubic)
+{
+    if (!cubic->steady_last_max_cwnd_valid) {
+        cubic->steady_time_to_origin = 0.0;
+        cubic->steady_origin_point = cubic->cwnd;
+        cubic->steady_origin_point_valid = 1;
+        return;
+    }
+
+    if (cubic->steady_last_max_cwnd <= cubic->cwnd) {
+        cubic->steady_time_to_origin = 0.0;
+        cubic->steady_origin_point = cubic->steady_last_max_cwnd;
+        cubic->steady_origin_point_valid = 1;
+        return;
+    }
+
+    double bytes_to_origin =
+        (double)(cubic->steady_last_max_cwnd - cubic->cwnd);
+
+    cubic->steady_time_to_origin =
+        cbrt(bytes_to_origin * 1000.0 * 1000.0
+             / (double)XQC_CUBIC_MSS
+             * (XQC_CUBIC_TIME_SCALING_FACTOR * 1000.0));
+    cubic->steady_origin_point = cubic->steady_last_max_cwnd;
+    cubic->steady_origin_point_valid = 1;
+}
+
+
+static int64_t
+xqc_cubic_calculate_cwnd_delta(xqc_cubic_t *cubic, xqc_usec_t now)
+{
+    if (!cubic->steady_last_reduction_time_valid
+        || now < cubic->steady_last_reduction_time)
+    {
+        return 0;
+    }
+
+    xqc_usec_t elapsed_us = now - cubic->steady_last_reduction_time;
+    double elapsed_ms = (double)((elapsed_us + 999) / 1000);
+    double offset = elapsed_ms - cubic->steady_time_to_origin;
+    double delta = (double)XQC_CUBIC_MSS * XQC_CUBIC_TIME_SCALING_FACTOR
+                   * pow(offset, 3.0) / 1000.0 / 1000.0 / 1000.0;
+
+    if (delta >= (double)INT64_MAX) {
+        return INT64_MAX;
+    }
+
+    if (delta <= (double)INT64_MIN) {
+        return INT64_MIN;
+    }
+
+    return (int64_t)floor(delta);
+}
+
+
+static uint64_t
+xqc_cubic_calculate_cwnd(xqc_cubic_t *cubic, int64_t delta)
+{
+    uint64_t origin = cubic->steady_last_max_cwnd_valid
+                      ? cubic->steady_last_max_cwnd : cubic->cwnd;
+
+    if (delta >= 0) {
+        uint64_t inc = (uint64_t)delta;
+        if (XQC_MAX_UINT64_VALUE - origin < inc) {
+            return cubic->max_cwnd;
+        }
+        return xqc_cubic_bound_cwnd(cubic, origin + inc);
+    }
+
+    if (delta == INT64_MIN || (uint64_t)(-delta) > origin) {
+        return cubic->min_cwnd;
+    }
+
+    return xqc_cubic_bound_cwnd(cubic, origin - (uint64_t)(-delta));
+}
+
+
+static void
+xqc_cubic_cubic_reduction(xqc_cubic_t *cubic, xqc_usec_t loss_time)
+{
+    if (!cubic->steady_last_max_cwnd_valid
+        || cubic->cwnd >= cubic->steady_last_max_cwnd)
+    {
+        cubic->steady_last_max_cwnd = cubic->cwnd;
+
+    } else {
+        cubic->steady_last_max_cwnd =
+            (uint64_t)((double)cubic->cwnd * XQC_CUBIC_LAST_MAX_REDUCTION_FACTOR);
+    }
+
+    cubic->steady_last_max_cwnd_valid = 1;
+    cubic->steady_last_reduction_time = loss_time;
+    cubic->steady_last_reduction_time_valid = 1;
+    cubic->steady_origin_point_valid = 0;
+
+    cubic->cwnd = xqc_cubic_bound_cwnd(cubic,
+        (uint64_t)((double)cubic->cwnd * XQC_CUBIC_REDUCTION_FACTOR));
+
+    if (cubic->steady_tcp_friendly) {
+        cubic->steady_est_reno_cwnd = cubic->cwnd;
+    }
+}
+
+
+static uint32_t
+xqc_cubic_pacing_gain(xqc_cubic_t *cubic)
+{
+    switch (cubic->state) {
+    case XQC_CUBIC_STATE_HYSTART:
+        return XQC_CUBIC_PACING_GAIN_HYSTART;
+
+    case XQC_CUBIC_STATE_FAST_RECOVERY:
+        return XQC_CUBIC_PACING_GAIN_RECOVERY;
+
+    case XQC_CUBIC_STATE_STEADY:
+    default:
+        return XQC_CUBIC_PACING_GAIN_STEADY;
+    }
+}
+
+
+static void
+xqc_cubic_on_ack_hystart(xqc_cubic_t *cubic, xqc_packet_out_t *po,
+    uint32_t acked_bytes, xqc_usec_t latest_rtt, xqc_usec_t now)
+{
+    if (XQC_CUBIC_MVFST_ONLY_GROW_WHEN_LIMITED
+        && cubic->ctl_ctx
+        && !xqc_send_ctl_is_cwnd_limited(cubic->ctl_ctx))
+    {
+        return;
+    }
+
+    if (!cubic->hystart_in_round) {
+        xqc_cubic_start_hystart_round(cubic, now);
+    }
+
+    cubic->cwnd = xqc_cubic_bound_cwnd(cubic, cubic->cwnd + acked_bytes);
+
+    if (xqc_cubic_hystart_maybe_exit(cubic)) {
+        return;
+    }
+
+    if (cubic->hystart_found == XQC_CUBIC_HYSTART_FOUND_NO
+        && cubic->hystart_ack_train)
+    {
+        if (!cubic->hystart_delay_min_valid
+            || latest_rtt < cubic->hystart_delay_min)
+        {
+            cubic->hystart_delay_min = latest_rtt;
+            cubic->hystart_delay_min_valid = 1;
+        }
+
+        if (now >= cubic->hystart_last_jiffy
+            && now - cubic->hystart_last_jiffy <= XQC_CUBIC_HYSTART_ACK_TRAIN_GAP)
+        {
+            cubic->hystart_last_jiffy = now;
+            if (cubic->hystart_delay_min_valid
+                && (now - cubic->hystart_round_start) * 2 >= cubic->hystart_delay_min)
+            {
+                cubic->hystart_found = XQC_CUBIC_HYSTART_FOUND_ACK_TRAIN;
+            }
         }
     }
 
-    /*
-     * t = elapsed_time * 1024 / 1000000, convert microseconds to milliseconds,
-     * multiply by 1024 in order to be able to use bit operations later.
-     */
-    t = (now + cubic->min_rtt - cubic->epoch_start) << XQC_CUBIC_TIME_SCALE;
-    t /= XQC_MICROS_PER_SECOND;
+    if (cubic->hystart_found == XQC_CUBIC_HYSTART_FOUND_NO) {
+        if (cubic->hystart_ack_count < XQC_CUBIC_HYSTART_ACKS) {
+            if (!cubic->hystart_curr_sampled_rtt_valid
+                || latest_rtt < cubic->hystart_curr_sampled_rtt)
+            {
+                cubic->hystart_curr_sampled_rtt = latest_rtt;
+                cubic->hystart_curr_sampled_rtt_valid = 1;
+            }
 
-    /* calculate |t - K| */
-    if (t < cubic->bic_K) {
-        offs = cubic->bic_K - t;
+            cubic->hystart_ack_count++;
+            if (cubic->hystart_ack_count < XQC_CUBIC_HYSTART_ACKS) {
+                goto maybe_end_round;
+            }
+        }
 
-    } else {
-        offs = t - cubic->bic_K;
+        if (cubic->hystart_last_sampled_rtt_valid
+            && cubic->hystart_curr_sampled_rtt_valid)
+        {
+            xqc_usec_t eta =
+                xqc_cubic_hystart_delay_threshold(cubic->hystart_last_sampled_rtt);
+            if (cubic->hystart_curr_sampled_rtt
+                >= cubic->hystart_last_sampled_rtt + eta)
+            {
+                cubic->hystart_found = XQC_CUBIC_HYSTART_FOUND_DELAY;
+            }
+        }
     }
 
-    /* 410/1024 * off/1024 * off/1024 * off/1024 * MSS */
-    delta = (XQC_CUBIC_C * offs * offs * offs) >> XQC_CUBE_SCALE;
-    delta *= XQC_CUBIC_MSS;
-
-    if (t < cubic->bic_K) {
-        bic_target = cubic->bic_origin_point - delta;
-
-    } else {
-        bic_target = cubic->bic_origin_point + delta;
+    if (xqc_cubic_hystart_maybe_exit(cubic)) {
+        return;
     }
 
-    /* the maximum growth rate of CUBIC is 1.5x per RTT, i.e. 1 window every 2 ack. */
-    bic_target = xqc_min(bic_target, cubic->cwnd + acked_bytes / 2);
-
-    /* take the maximum of the cwnd of TCP reno and the cwnd of cubic */
-    bic_target = xqc_max(cubic->tcp_cwnd, bic_target);
-
-    if (bic_target == 0) {
-        bic_target = cubic->init_cwnd;
+maybe_end_round:
+    if (cubic->hystart_in_round
+        && po->po_sent_time > cubic->hystart_round_end_time)
+    {
+        cubic->hystart_in_round = 0;
     }
-
-    cubic->cwnd = bic_target;
 }
 
-/* https://datatracker.ietf.org/doc/html/rfc9002#appendix-B.5 */
-static int
-xqc_cubic_in_congestion_recovery(void *cong_ctl, xqc_usec_t sent_time)
+
+static void
+xqc_cubic_on_ack_steady(xqc_cubic_t *cubic, uint32_t acked_bytes, xqc_usec_t now)
 {
-    xqc_cubic_t *cubic = (xqc_cubic_t*)(cong_ctl);
-    return sent_time <= cubic->congestion_recovery_start_time;
+    if (XQC_CUBIC_MVFST_ONLY_GROW_WHEN_LIMITED
+        && cubic->ctl_ctx
+        && !xqc_send_ctl_is_cwnd_limited(cubic->ctl_ctx))
+    {
+        return;
+    }
+
+    if (!cubic->steady_last_max_cwnd_valid) {
+        cubic->steady_time_to_origin = 0.0;
+        cubic->steady_last_max_cwnd = cubic->cwnd;
+        cubic->steady_last_max_cwnd_valid = 1;
+        cubic->steady_origin_point = cubic->cwnd;
+        cubic->steady_origin_point_valid = 1;
+        if (cubic->steady_tcp_friendly) {
+            cubic->steady_est_reno_cwnd = cubic->cwnd;
+        }
+    }
+
+    if (!cubic->steady_origin_point_valid
+        || cubic->steady_origin_point != cubic->steady_last_max_cwnd)
+    {
+        xqc_cubic_update_time_to_origin(cubic);
+    }
+
+    if (!cubic->steady_last_reduction_time_valid) {
+        cubic->steady_last_reduction_time = now;
+        cubic->steady_last_reduction_time_valid = 1;
+    }
+
+    uint64_t new_cwnd =
+        xqc_cubic_calculate_cwnd(cubic, xqc_cubic_calculate_cwnd_delta(cubic, now));
+
+    if (cubic->steady_additive_after_hystart && new_cwnd < cubic->ssthresh) {
+        uint64_t delta = acked_bytes / 10;
+        if (new_cwnd < cubic->cwnd + delta) {
+            new_cwnd = xqc_cubic_bound_cwnd(cubic, cubic->cwnd + delta);
+        }
+    }
+
+    if (new_cwnd >= cubic->cwnd) {
+        cubic->cwnd = new_cwnd;
+    }
+
+    if (cubic->steady_tcp_friendly && acked_bytes && cubic->steady_est_reno_cwnd) {
+        double reno_cwnd = (double)cubic->steady_est_reno_cwnd
+            + XQC_CUBIC_TCP_FRIENDLY_FACTOR
+              * (double)acked_bytes
+              * (double)XQC_CUBIC_MSS
+              / (double)cubic->steady_est_reno_cwnd;
+
+        if (reno_cwnd >= (double)XQC_MAX_UINT64_VALUE) {
+            cubic->steady_est_reno_cwnd = cubic->max_cwnd;
+
+        } else {
+            cubic->steady_est_reno_cwnd =
+                xqc_cubic_bound_cwnd(cubic, (uint64_t)reno_cwnd);
+        }
+
+        cubic->cwnd = xqc_max(cubic->cwnd, cubic->steady_est_reno_cwnd);
+    }
 }
 
-size_t
-xqc_cubic_size()
+
+static void
+xqc_cubic_on_ack_recovery(xqc_cubic_t *cubic, xqc_packet_out_t *po, xqc_usec_t now)
+{
+    if (cubic->recovery_end_time_valid
+        && po->po_sent_time > cubic->recovery_end_time)
+    {
+        cubic->state = XQC_CUBIC_STATE_STEADY;
+
+        if (cubic->steady_last_max_cwnd_valid
+            && cubic->steady_last_reduction_time_valid)
+        {
+            xqc_cubic_update_time_to_origin(cubic);
+            cubic->cwnd = xqc_cubic_calculate_cwnd(cubic,
+                xqc_cubic_calculate_cwnd_delta(cubic, now));
+        }
+    }
+}
+
+
+static size_t
+xqc_cubic_size(void)
 {
     return sizeof(xqc_cubic_t);
 }
+
 
 static void
 xqc_cubic_init(void *cong_ctl, xqc_send_ctl_t *ctl_ctx, xqc_cc_params_t cc_params)
 {
     xqc_cubic_t *cubic = (xqc_cubic_t *)(cong_ctl);
 
-    cubic->init_cwnd = XQC_CUBIC_INIT_WIN;
-    cubic->min_cwnd = XQC_CUBIC_MIN_WIN;
+    cubic->init_cwnd = XQC_CUBIC_INIT_CWND_MSS * XQC_CUBIC_MSS;
+    cubic->min_cwnd = XQC_CUBIC_MIN_CWND_MSS * XQC_CUBIC_MSS;
+    cubic->max_cwnd = XQC_CUBIC_MAX_CWND_MSS * XQC_CUBIC_MSS;
 
     if (cc_params.customize_on) {
-        cc_params.min_cwnd *= XQC_CUBIC_MSS;
-        cc_params.init_cwnd *= XQC_CUBIC_MSS;
-        cubic->init_cwnd =
-                cc_params.init_cwnd >= XQC_CUBIC_MIN_WIN && cc_params.init_cwnd <= XQC_CUBIC_MAX_INIT_WIN ?
-                cc_params.init_cwnd : XQC_CUBIC_INIT_WIN;
-        cubic->min_cwnd = 
-                cc_params.min_cwnd >= XQC_CUBIC_MIN_WIN && cc_params.min_cwnd <= XQC_CUBIC_MAX_MIN_WIN ?
-                cc_params.min_cwnd : XQC_CUBIC_MIN_WIN;
+        uint64_t init_cwnd = cc_params.init_cwnd * XQC_CUBIC_MSS;
+        uint64_t min_cwnd = cc_params.min_cwnd * XQC_CUBIC_MSS;
+
+        if (init_cwnd >= cubic->min_cwnd && init_cwnd <= cubic->max_cwnd) {
+            cubic->init_cwnd = init_cwnd;
+        }
+
+        if (min_cwnd > 0 && min_cwnd <= cubic->init_cwnd) {
+            cubic->min_cwnd = min_cwnd;
+        }
     }
 
-    cubic->epoch_start = 0;
-    cubic->cwnd = cubic->init_cwnd;
-    cubic->tcp_cwnd = cubic->init_cwnd;
-    cubic->tcp_cwnd_cnt = 0;
-    cubic->last_max_cwnd = cubic->init_cwnd;
+    cubic->cwnd = xqc_cubic_bound_cwnd(cubic, cubic->init_cwnd);
     cubic->ssthresh = XQC_CUBIC_MAX_SSTHRESH;
-    cubic->congestion_recovery_start_time = 0;
+    cubic->state = XQC_CUBIC_STATE_HYSTART;
+
+    cubic->recovery_end_time = 0;
+    cubic->recovery_end_time_valid = 0;
+
+    cubic->hystart_ack_train = XQC_CUBIC_MVFST_ENABLE_ACK_TRAIN;
+    xqc_cubic_reset_hystart(cubic);
+
+    cubic->steady_time_to_origin = 0.0;
+    cubic->steady_origin_point = 0;
+    cubic->steady_origin_point_valid = 0;
+    cubic->steady_last_max_cwnd = 0;
+    cubic->steady_last_max_cwnd_valid = 0;
+    cubic->steady_last_reduction_time = 0;
+    cubic->steady_last_reduction_time_valid = 0;
+    cubic->steady_est_reno_cwnd = cubic->cwnd;
+    cubic->steady_tcp_friendly = XQC_CUBIC_MVFST_TCP_FRIENDLY;
+    cubic->steady_additive_after_hystart = XQC_CUBIC_MVFST_ADDITIVE_AFTER_HYSTART;
+
+    cubic->quiescence_start = 0;
+    cubic->quiescence_start_valid = 0;
+    cubic->ctl_ctx = ctl_ctx;
 }
 
 
 static void
 xqc_cubic_on_lost(void *cong_ctl, xqc_usec_t lost_sent_time)
 {
-    xqc_cubic_t *cubic = (xqc_cubic_t*)(cong_ctl);
+    xqc_cubic_t *cubic = (xqc_cubic_t *)(cong_ctl);
+    xqc_usec_t now = xqc_monotonic_timestamp();
 
-    cubic->tcp_cwnd_cnt = 0;
+    if (!cubic->recovery_end_time_valid
+        || lost_sent_time >= cubic->recovery_end_time)
+    {
+        cubic->recovery_end_time = now;
+        cubic->recovery_end_time_valid = 1;
 
-    /* No reaction if already in a recovery period. */
-    if (xqc_cubic_in_congestion_recovery(cong_ctl, lost_sent_time)) {
-        return;
+        xqc_cubic_cubic_reduction(cubic, now);
+
+        if (cubic->state == XQC_CUBIC_STATE_HYSTART
+            || cubic->state == XQC_CUBIC_STATE_STEADY)
+        {
+            cubic->state = XQC_CUBIC_STATE_FAST_RECOVERY;
+        }
+
+        cubic->ssthresh = cubic->cwnd;
     }
-
-    cubic->congestion_recovery_start_time = xqc_monotonic_timestamp();
-    cubic->epoch_start = 0;
-
-    /* should we make room for others */
-    if (XQC_CUBIC_FAST_CONVERGENCE && cubic->cwnd < cubic->last_max_cwnd) {
-        /* (1.0f + XQC_CUBIC_BETA) / 2.0f convert to bitwise operations */
-        cubic->last_max_cwnd = cubic->cwnd * (XQC_CUBIC_BETA_SCALE + XQC_CUBIC_BETA) / (2 * XQC_CUBIC_BETA_SCALE);
-
-    } else {
-        cubic->last_max_cwnd = cubic->cwnd;
-    }
-
-    /* Multiplicative Decrease */
-    cubic->cwnd = cubic->cwnd * XQC_CUBIC_BETA / XQC_CUBIC_BETA_SCALE;
-    cubic->cwnd = xqc_max(cubic->cwnd, cubic->min_cwnd);
-    cubic->tcp_cwnd = cubic->cwnd;
-    cubic->ssthresh = cubic->cwnd;
 }
 
 
@@ -182,71 +524,119 @@ static void
 xqc_cubic_on_ack(void *cong_ctl, xqc_packet_out_t *po, xqc_usec_t now)
 {
     xqc_cubic_t *cubic = (xqc_cubic_t *)(cong_ctl);
-    xqc_usec_t  sent_time = po->po_sent_time;
-    uint32_t    acked_bytes = po->po_used_size;
+    uint32_t acked_bytes = po->po_used_size;
+    xqc_usec_t latest_rtt = now >= po->po_sent_time ? now - po->po_sent_time : 0;
 
-    xqc_usec_t  rtt = now - sent_time;
-
-    if (cubic->min_rtt == 0 || rtt < cubic->min_rtt) {
-        cubic->min_rtt = rtt;
+    if (cubic->ctl_ctx && cubic->ctl_ctx->ctl_latest_rtt) {
+        latest_rtt = cubic->ctl_ctx->ctl_latest_rtt;
     }
 
-    /* Do not increase congestion window in recovery period. */
-    if (xqc_cubic_in_congestion_recovery(cong_ctl, po->po_sent_time)) {
+    if (cubic->recovery_end_time_valid
+        && cubic->recovery_end_time >= po->po_sent_time)
+    {
         return;
     }
 
-    if (cubic->cwnd < cubic->ssthresh) {
-        /* slow start */
-        cubic->tcp_cwnd += acked_bytes;
-        cubic->cwnd += acked_bytes;
+    switch (cubic->state) {
+    case XQC_CUBIC_STATE_HYSTART:
+        xqc_cubic_on_ack_hystart(cubic, po, acked_bytes, latest_rtt, now);
+        break;
 
-    } else {
-        /* congestion avoidance */
-        cubic->tcp_cwnd_cnt += acked_bytes;
-        if (cubic->tcp_cwnd_cnt >= cubic->tcp_cwnd) {
-            cubic->tcp_cwnd += XQC_CUBIC_MSS;
-            cubic->tcp_cwnd_cnt = 0;
-        }
-        xqc_cubic_update(cong_ctl, acked_bytes, now);
+    case XQC_CUBIC_STATE_STEADY:
+        xqc_cubic_on_ack_steady(cubic, acked_bytes, now);
+        break;
+
+    case XQC_CUBIC_STATE_FAST_RECOVERY:
+        xqc_cubic_on_ack_recovery(cubic, po, now);
+        break;
     }
 }
 
-uint64_t
+
+static uint64_t
 xqc_cubic_get_cwnd(void *cong_ctl)
 {
     xqc_cubic_t *cubic = (xqc_cubic_t *)(cong_ctl);
     return cubic->cwnd;
 }
 
-void
+
+static void
 xqc_cubic_reset_cwnd(void *cong_ctl)
 {
     xqc_cubic_t *cubic = (xqc_cubic_t *)(cong_ctl);
-    cubic->epoch_start = 0;
+
+    cubic->ssthresh = xqc_max(cubic->cwnd / 2, cubic->min_cwnd);
     cubic->cwnd = cubic->min_cwnd;
-    cubic->tcp_cwnd = cubic->min_cwnd;
-    cubic->last_max_cwnd = cubic->min_cwnd;
+    cubic->state = XQC_CUBIC_STATE_HYSTART;
+
+    cubic->steady_est_reno_cwnd = 0;
+    cubic->steady_last_reduction_time_valid = 0;
+    cubic->steady_last_max_cwnd_valid = 0;
+    cubic->steady_origin_point_valid = 0;
+    cubic->quiescence_start_valid = 0;
+    cubic->recovery_end_time_valid = 0;
+    xqc_cubic_reset_hystart(cubic);
 }
 
-int32_t
+
+static int
 xqc_cubic_in_slow_start(void *cong_ctl)
 {
     xqc_cubic_t *cubic = (xqc_cubic_t *)(cong_ctl);
-    return cubic->cwnd < cubic->ssthresh ? 1 : 0;
+    return cubic->state == XQC_CUBIC_STATE_HYSTART;
 }
 
-void
+
+static void
 xqc_cubic_restart_from_idle(void *cong_ctl, uint64_t arg)
 {
-    return;
+    xqc_cubic_t *cubic = (xqc_cubic_t *)(cong_ctl);
+    xqc_usec_t idle_start = (xqc_usec_t)arg;
+    xqc_usec_t now = xqc_monotonic_timestamp();
+
+    if (idle_start > 0
+        && now > idle_start
+        && cubic->steady_last_reduction_time_valid)
+    {
+        cubic->steady_last_reduction_time += now - idle_start;
+    }
+
+    cubic->quiescence_start_valid = 0;
 }
+
 
 static int
 xqc_cubic_in_recovery(void *cong_ctl)
 {
-    return 0;
+    xqc_cubic_t *cubic = (xqc_cubic_t *)(cong_ctl);
+    return cubic->state == XQC_CUBIC_STATE_FAST_RECOVERY;
 }
+
+
+static uint32_t
+xqc_cubic_get_pacing_rate(void *cong_ctl)
+{
+    xqc_cubic_t *cubic = (xqc_cubic_t *)(cong_ctl);
+
+    if (cubic->ctl_ctx == NULL) {
+        return 0;
+    }
+
+    xqc_usec_t srtt = cubic->ctl_ctx->ctl_srtt;
+    if (srtt == 0) {
+        srtt = cubic->ctl_ctx->ctl_conn->conn_settings.initial_rtt;
+    }
+
+    if (srtt == 0) {
+        return 0;
+    }
+
+    uint64_t rate = cubic->cwnd * XQC_MICROS_PER_SECOND / srtt;
+    rate = rate * xqc_cubic_pacing_gain(cubic) / 100;
+    return rate > XQC_MAX_UINT32_VALUE ? XQC_MAX_UINT32_VALUE : (uint32_t)rate;
+}
+
 
 const xqc_cong_ctrl_callback_t xqc_cubic_cb = {
     .xqc_cong_ctl_size              = xqc_cubic_size,
@@ -256,6 +646,7 @@ const xqc_cong_ctrl_callback_t xqc_cubic_cb = {
     .xqc_cong_ctl_get_cwnd          = xqc_cubic_get_cwnd,
     .xqc_cong_ctl_reset_cwnd        = xqc_cubic_reset_cwnd,
     .xqc_cong_ctl_in_slow_start     = xqc_cubic_in_slow_start,
-    .xqc_cong_ctl_restart_from_idle = xqc_cubic_restart_from_idle,
     .xqc_cong_ctl_in_recovery       = xqc_cubic_in_recovery,
+    .xqc_cong_ctl_restart_from_idle = xqc_cubic_restart_from_idle,
+    .xqc_cong_ctl_get_pacing_rate   = xqc_cubic_get_pacing_rate,
 };

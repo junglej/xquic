@@ -18,10 +18,12 @@
 #include <fcntl.h>
 #include <signal.h>
 #include <stdint.h>
+#include <limits.h>
 
 #include "platform.h"
 #include "src/common/xqc_common.h"
 #include "src/transport/xqc_stream.h"
+#include "src/congestion_control/xqc_cubic.h"
 
 #ifndef XQC_SYS_WINDOWS
 #include <unistd.h>
@@ -178,12 +180,12 @@ size_t g_lb_cid_enc_key_len = 0;
 static uint64_t last_snd_ts;
 static FILE *g_request_trace_fp = NULL;
 static char g_request_trace_path[512];
-static int g_request_trace_disabled = 0;
+static int g_request_trace_disabled = 1;
 static uint64_t g_request_trace_sample_us = 100000;
 static int g_request_trace_full = 0;
 static FILE *g_stream_trace_fp = NULL;
 static char g_stream_trace_path[512];
-static int g_stream_trace_disabled = 0;
+static int g_stream_trace_disabled = 1;
 static uint64_t g_stream_trace_sample_us = 100000;
 static int g_stream_trace_full = 0;
 static FILE *g_recv_rate_trace_fp = NULL;
@@ -2619,13 +2621,45 @@ xqc_server_refuse(xqc_engine_t *engine, xqc_connection_t *conn,
 }
 
 static int
+xqc_server_env_socket_buffer_bytes(const char *name, int default_value)
+{
+    const char *value = getenv(name);
+    if (value == NULL || value[0] == '\0') {
+        return default_value;
+    }
+
+    errno = 0;
+    char *end = NULL;
+    unsigned long long parsed = strtoull(value, &end, 10);
+    if (errno != 0 || end == value || *end != '\0' || parsed > INT_MAX) {
+        printf("invalid %s:%s, use default:%d\n", name, value, default_value);
+        return default_value;
+    }
+    if (parsed == 0) {
+        return default_value;
+    }
+    return (int) parsed;
+}
+
+static void
+xqc_server_print_socket_buffer(int fd, int optname, const char *label, int requested)
+{
+    int actual = 0;
+    socklen_t actual_len = sizeof(actual);
+    if (getsockopt(fd, SOL_SOCKET, optname, &actual, &actual_len) == 0) {
+        printf("socket buffer %s requested:%d actual:%d\n", label, requested, actual);
+    }
+}
+
+static int
 xqc_server_create_socket(const char *addr, unsigned int port)
 {
     int fd;
     int type = g_ipv6 ? AF_INET6 : AF_INET;
     ctx.local_addrlen = g_ipv6 ? sizeof(struct sockaddr_in6) : sizeof(struct sockaddr_in);
     struct sockaddr *saddr = (struct sockaddr *)&ctx.local_addr;
-    int size;
+    int rcvbuf_size;
+    int sndbuf_size;
     int optval;
 
     fd = socket(type, SOCK_DGRAM, 0);
@@ -2651,16 +2685,19 @@ xqc_server_create_socket(const char *addr, unsigned int port)
         goto err;
     }
 
-    size = 1 * 1024 * 1024;
-    if (setsockopt(fd, SOL_SOCKET, SO_RCVBUF, &size, sizeof(int)) < 0) {
+    rcvbuf_size = xqc_server_env_socket_buffer_bytes("XQUIC_TEST_SOCKET_RCVBUF_BYTES", 1 * 1024 * 1024);
+    sndbuf_size = xqc_server_env_socket_buffer_bytes("XQUIC_TEST_SOCKET_SNDBUF_BYTES", 1 * 1024 * 1024);
+    if (setsockopt(fd, SOL_SOCKET, SO_RCVBUF, &rcvbuf_size, sizeof(int)) < 0) {
         printf("setsockopt failed, errno: %d\n", get_sys_errno());
         goto err;
     }
 
-    if (setsockopt(fd, SOL_SOCKET, SO_SNDBUF, &size, sizeof(int)) < 0) {
+    if (setsockopt(fd, SOL_SOCKET, SO_SNDBUF, &sndbuf_size, sizeof(int)) < 0) {
         printf("setsockopt failed, errno: %d\n", get_sys_errno());
         goto err;
     }
+    xqc_server_print_socket_buffer(fd, SO_RCVBUF, "SO_RCVBUF", rcvbuf_size);
+    xqc_server_print_socket_buffer(fd, SO_SNDBUF, "SO_SNDBUF", sndbuf_size);
 
     if (type == AF_INET6) {
         memset(saddr, 0, sizeof(struct sockaddr_in6));
@@ -3086,6 +3123,9 @@ int main(int argc, char *argv[]) {
                 c_cong_plus = 1;
             }
             printf("option cong_ctl : %c: %s: plus? %d\n", c_cong_ctl, optarg, c_cong_plus);
+            if (c_cong_ctl == 'c') {
+                printf("option cubic_semantics:%s\n", xqc_cubic_semantics());
+            }
             break;
         case 'L':
             printf("option endless_sending: %s\n", "on");
@@ -3232,21 +3272,25 @@ int main(int argc, char *argv[]) {
                 break;
 
             case 7:
+                g_request_trace_disabled = 0;
                 g_request_trace_sample_us = (uint64_t) atoi(optarg) * 1000;
                 printf("option request trace sample ms :%s\n", optarg);
                 break;
 
             case 8:
+                g_request_trace_disabled = 0;
                 g_request_trace_full = 1;
                 printf("option request trace full logging\n");
                 break;
 
             case 9:
+                g_stream_trace_disabled = 0;
                 g_stream_trace_sample_us = (uint64_t) atoi(optarg) * 1000;
                 printf("option stream trace sample ms :%s\n", optarg);
                 break;
 
             case 10:
+                g_stream_trace_disabled = 0;
                 g_stream_trace_full = 1;
                 printf("option stream trace full logging\n");
                 break;

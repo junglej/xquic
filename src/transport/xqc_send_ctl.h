@@ -132,6 +132,9 @@ typedef struct xqc_send_ctl_s {
     uint32_t                    ctl_reinj_dgram_recv_count;
 
     uint32_t                    ctl_max_bytes_in_flight;
+    xqc_packet_number_t         ctl_cwnd_usage_end_pn;
+    xqc_pkt_num_space_t         ctl_cwnd_usage_pns;
+    uint8_t                     ctl_cwnd_usage_valid;
     uint8_t                     ctl_is_cwnd_limited;
 
     unsigned                    ctl_bytes_in_flight;
@@ -175,11 +178,16 @@ typedef struct xqc_send_ctl_s {
 } xqc_send_ctl_t;
 
 
+/*
+ * Per-path connection-level PTO estimate used by callers that do not need
+ * packet-number-space granularity. Per RFC 9002, PTO uses the peer-reported
+ * max_ack_delay because this endpoint is waiting for the peer's ACK.
+ */
 static inline xqc_usec_t
 xqc_send_ctl_calc_pto(xqc_send_ctl_t *send_ctl)
 {
     return send_ctl->ctl_srtt + xqc_max(4 * send_ctl->ctl_rttvar, XQC_kGranularity * 1000)
-        + send_ctl->ctl_conn->local_settings.max_ack_delay * 1000;
+        + send_ctl->ctl_conn->remote_settings.max_ack_delay * 1000;
 }
 
 
@@ -218,6 +226,8 @@ void xqc_send_ctl_decrease_inflight(xqc_connection_t *conn, xqc_packet_out_t *pa
 void xqc_send_ctl_on_pns_discard(xqc_send_ctl_t *send_ctl, xqc_pkt_num_space_t pns);
 
 void xqc_send_ctl_on_packet_sent(xqc_send_ctl_t *send_ctl, xqc_pn_ctl_t *pn_ctl, xqc_packet_out_t *packet_out, xqc_usec_t now);
+
+void xqc_send_ctl_update_cwnd_limited(xqc_send_ctl_t *send_ctl, xqc_packet_out_t *packet_out, xqc_usec_t now);
 
 int xqc_send_ctl_on_ack_received (xqc_send_ctl_t *send_ctl, xqc_pn_ctl_t *pn_ctl, xqc_send_queue_t *send_queue, xqc_ack_info_t *const ack_info, xqc_usec_t ack_recv_time, xqc_bool_t ack_on_same_path);
 

@@ -27,7 +27,9 @@
 
 #define XQC_WIFI_MONITOR_MAX_IFACES 2
 #define XQC_WIFI_MONITOR_MIN_SAMPLES 5
-#define XQC_WIFI_MONITOR_LOG_INTERVAL_US 1000000ULL
+#define XQC_WIFI_MONITOR_DEFAULT_LOG_INTERVAL_US 1000000ULL
+#define XQC_WIFI_MONITOR_MIN_LOG_INTERVAL_US 10000ULL
+#define XQC_WIFI_MONITOR_MAX_LOG_INTERVAL_US 10000000ULL
 #define XQC_WIFI_MONITOR_KEEP_STATUS INT_MIN
 #define XQC_WIFI_MONITOR_START_WAIT_US 5000000ULL
 #define XQC_WIFI_GTSD_WINDOW_SIZE 128
@@ -47,11 +49,11 @@ typedef struct xqc_wifi_iface_state_s {
     char                        ifname[64];
     unsigned int                ifindex;
     xqc_wifi_state_snapshot_t   snapshot;
-    double                      ewma_long_gap;
+    double                      ewma_long_txop_interval;
     uint64_t                    last_logged_ts_us;
-    uint32_t                    gap_window[XQC_WIFI_GTSD_WINDOW_SIZE];
-    uint32_t                    gap_window_count;
-    uint32_t                    gap_window_idx;
+    uint32_t                    txop_interval_window[XQC_WIFI_GTSD_WINDOW_SIZE];
+    uint32_t                    txop_interval_window_count;
+    uint32_t                    txop_interval_window_idx;
     uint32_t                    gtsd_since_update;
     uint64_t                    gtsd_p95_baseline_us;
 } xqc_wifi_iface_state_t;
@@ -77,7 +79,7 @@ struct xqc_wifi_monitor_s {
     uint64_t                    rb_wifi_pkt_events;
     uint64_t                    rb_wifi_pkt_bad_size;
     uint64_t                    state_update_attempts;
-    uint64_t                    state_update_gap_zero;
+    uint64_t                    state_update_txop_interval_zero;
     uint64_t                    state_update_unknown_ifindex;
     uint64_t                    state_update_accepted;
     uint64_t                    state_emit_count;
@@ -87,7 +89,7 @@ struct xqc_wifi_monitor_s {
     uint64_t                    poll_errors;
     int                         last_poll_rc;
     uint64_t                    last_event_ifindex;
-    uint64_t                    last_event_gap_us;
+    uint64_t                    last_event_txop_interval_us;
     uint64_t                    last_event_ampdu_len;
     uint64_t                    last_event_ampdu_ack_len;
     uint64_t                    last_event_len;
@@ -182,7 +184,7 @@ xqc_wifi_gtsd_tail_guard(const xqc_wifi_iface_state_t *iface_state)
 }
 
 static void
-xqc_wifi_gtsd_update(xqc_wifi_iface_state_t *iface_state, uint32_t gap_us)
+xqc_wifi_gtsd_update(xqc_wifi_iface_state_t *iface_state, uint32_t txop_interval_us)
 {
     xqc_wifi_state_snapshot_t *snapshot;
     uint32_t p50;
@@ -192,19 +194,19 @@ xqc_wifi_gtsd_update(xqc_wifi_iface_state_t *iface_state, uint32_t gap_us)
     double evidence;
     int tail_guard;
 
-    if (iface_state == NULL || gap_us == 0) {
+    if (iface_state == NULL || txop_interval_us == 0) {
         return;
     }
 
     snapshot = &iface_state->snapshot;
-    iface_state->gap_window[iface_state->gap_window_idx] = gap_us;
-    iface_state->gap_window_idx =
-        (iface_state->gap_window_idx + 1) % XQC_WIFI_GTSD_WINDOW_SIZE;
-    if (iface_state->gap_window_count < XQC_WIFI_GTSD_WINDOW_SIZE) {
-        iface_state->gap_window_count++;
+    iface_state->txop_interval_window[iface_state->txop_interval_window_idx] = txop_interval_us;
+    iface_state->txop_interval_window_idx =
+        (iface_state->txop_interval_window_idx + 1) % XQC_WIFI_GTSD_WINDOW_SIZE;
+    if (iface_state->txop_interval_window_count < XQC_WIFI_GTSD_WINDOW_SIZE) {
+        iface_state->txop_interval_window_count++;
     }
 
-    if (iface_state->gap_window_count < XQC_WIFI_GTSD_WINDOW_SIZE) {
+    if (iface_state->txop_interval_window_count < XQC_WIFI_GTSD_WINDOW_SIZE) {
         snapshot->state = XQC_WIFI_PATH_STATE_UNKNOWN;
         return;
     }
@@ -214,10 +216,10 @@ xqc_wifi_gtsd_update(xqc_wifi_iface_state_t *iface_state, uint32_t gap_us)
     }
     iface_state->gtsd_since_update = 0;
 
-    p50 = xqc_wifi_quantile_u32(iface_state->gap_window,
-        iface_state->gap_window_count, 0.50);
-    p95 = xqc_wifi_quantile_u32(iface_state->gap_window,
-        iface_state->gap_window_count, 0.95);
+    p50 = xqc_wifi_quantile_u32(iface_state->txop_interval_window,
+        iface_state->txop_interval_window_count, 0.50);
+    p95 = xqc_wifi_quantile_u32(iface_state->txop_interval_window,
+        iface_state->txop_interval_window_count, 0.95);
     ratio = p50 > 0 ? (double) p95 / (double) p50 : 0.0;
 
     snapshot->tail_p50_us = p50;
@@ -369,6 +371,41 @@ xqc_wifi_env_enabled(const char *name)
     return value != NULL && value[0] != '\0' && value[0] != '0';
 }
 
+static uint64_t
+xqc_wifi_parse_u64(const char *value, uint64_t default_value)
+{
+    char *end = NULL;
+    unsigned long long parsed;
+
+    if (value == NULL || value[0] == '\0') {
+        return default_value;
+    }
+
+    errno = 0;
+    parsed = strtoull(value, &end, 10);
+    if (errno != 0 || end == value || *end != '\0') {
+        return default_value;
+    }
+
+    return (uint64_t) parsed;
+}
+
+static uint64_t
+xqc_wifi_normalize_log_interval_us(uint64_t interval_us)
+{
+    if (interval_us == 0) {
+        return XQC_WIFI_MONITOR_DEFAULT_LOG_INTERVAL_US;
+    }
+    if (interval_us < XQC_WIFI_MONITOR_MIN_LOG_INTERVAL_US) {
+        return XQC_WIFI_MONITOR_MIN_LOG_INTERVAL_US;
+    }
+    if (interval_us > XQC_WIFI_MONITOR_MAX_LOG_INTERVAL_US) {
+        return XQC_WIFI_MONITOR_MAX_LOG_INTERVAL_US;
+    }
+
+    return interval_us;
+}
+
 static const char *
 xqc_wifi_state_label(xqc_wifi_path_state_t state)
 {
@@ -402,8 +439,8 @@ xqc_wifi_bpf_diag_name(int key)
         return "tx_status_flow_mismatch";
     case XQC_WIFI_BPF_DIAG_TX_STATUS_TX_IFINDEX_ZERO:
         return "tx_status_tx_ifindex_zero";
-    case XQC_WIFI_BPF_DIAG_TX_STATUS_GAP_ZERO_STATE_ONLY:
-        return "tx_status_gap_zero_state_only";
+    case XQC_WIFI_BPF_DIAG_TX_STATUS_TXOP_INTERVAL_ZERO_STATE_ONLY:
+        return "tx_status_txop_interval_zero_state_only";
     case XQC_WIFI_BPF_DIAG_TX_STATUS_STATE_SAMPLE_SKIP:
         return "tx_status_state_sample_skip";
     case XQC_WIFI_BPF_DIAG_TX_STATUS_RING_SUBMIT:
@@ -436,7 +473,7 @@ xqc_wifi_monitor_note_wifi_pkt_event(xqc_wifi_monitor_t *monitor,
     }
 
     monitor->last_event_ifindex = event->tx_ifindex;
-    monitor->last_event_gap_us = event->gap;
+    monitor->last_event_txop_interval_us = event->txop_interval_us;
     monitor->last_event_ampdu_len = event->ampdu_len;
     monitor->last_event_ampdu_ack_len = event->ampdu_ack_len;
     monitor->last_event_len = event->len;
@@ -464,18 +501,18 @@ xqc_wifi_log_link_state(xqc_wifi_monitor_t *monitor,
         snapshot->ifindex,
         xqc_wifi_state_label(snapshot->state),
         (unsigned long long) snapshot->sample_count,
-        (unsigned long long) snapshot->last_gap_us,
+        (unsigned long long) snapshot->last_txop_interval_us,
         (unsigned long long) snapshot->last_mac_rtt_us,
         (unsigned long long) snapshot->last_service_bytes,
         snapshot->last_amsdu_subframes,
         (unsigned long long) snapshot->last_amsdu_bytes,
-        snapshot->ewma_gap_us,
+        snapshot->ewma_txop_interval_us,
         snapshot->ewma_airtime_us,
         snapshot->ewma_mac_rtt_us,
         snapshot->ewma_service_bytes,
         snapshot->ewma_service_time_us,
         snapshot->service_rate_bytes_per_us,
-        snapshot->p_long_gap,
+        snapshot->p_long_txop_interval,
         snapshot->pi_degraded,
         (unsigned long long) snapshot->tail_p50_us,
         (unsigned long long) snapshot->tail_p95_us,
@@ -491,13 +528,19 @@ xqc_wifi_emit_state_locked(xqc_wifi_monitor_t *monitor,
     xqc_wifi_iface_state_t *iface_state, uint64_t ts_us, int force)
 {
     xqc_wifi_state_snapshot_t snapshot;
+    uint64_t interval_us;
 
     if (monitor == NULL || iface_state == NULL || monitor->config.state_update_cb == NULL) {
         return;
     }
 
+    interval_us = monitor->config.state_log_interval_us;
+    if (interval_us == 0) {
+        interval_us = XQC_WIFI_MONITOR_DEFAULT_LOG_INTERVAL_US;
+    }
+
     if (!force && iface_state->last_logged_ts_us != 0
-        && ts_us < iface_state->last_logged_ts_us + XQC_WIFI_MONITOR_LOG_INTERVAL_US)
+        && ts_us < iface_state->last_logged_ts_us + interval_us)
     {
         monitor->state_emit_suppressed_interval++;
         return;
@@ -535,7 +578,7 @@ xqc_wifi_update_iface_state(xqc_wifi_monitor_t *monitor,
     double pi_pred;
     double log_odds;
     double log_lr;
-    int long_gap;
+    int long_txop_interval;
 
     if (monitor == NULL || event == NULL) {
         return;
@@ -543,8 +586,8 @@ xqc_wifi_update_iface_state(xqc_wifi_monitor_t *monitor,
 
     pthread_mutex_lock(&monitor->lock);
     monitor->state_update_attempts++;
-    if (event->gap == 0) {
-        monitor->state_update_gap_zero++;
+    if (event->txop_interval_us == 0) {
+        monitor->state_update_txop_interval_zero++;
         pthread_mutex_unlock(&monitor->lock);
         return;
     }
@@ -559,7 +602,7 @@ xqc_wifi_update_iface_state(xqc_wifi_monitor_t *monitor,
 
     get_tm(event->ts_ns, offset, &sec, &nsec);
     ts_us = sec * 1000000ULL + nsec / 1000ULL;
-    long_gap = event->gap > tau_us ? 1 : 0;
+    long_txop_interval = event->txop_interval_us > tau_us ? 1 : 0;
     service_bytes = event->service_bytes;
     if (service_bytes == 0) {
         uint64_t mpdu_bytes = event->amsdu_bytes ? event->amsdu_bytes : event->len;
@@ -567,10 +610,10 @@ xqc_wifi_update_iface_state(xqc_wifi_monitor_t *monitor,
             (event->ampdu_len ? event->ampdu_len : 1);
         service_bytes = mpdu_bytes * burst_frames;
     }
-    service_time_us = (double) event->gap + (double) event->airtime;
+    service_time_us = (double) event->txop_interval_us + (double) event->airtime;
 
     old_state = iface_state->snapshot.state;
-    iface_state->snapshot.last_gap_us = event->gap;
+    iface_state->snapshot.last_txop_interval_us = event->txop_interval_us;
     iface_state->snapshot.last_mac_rtt_us = event->mac_rtt_us;
     iface_state->snapshot.last_service_bytes = service_bytes;
     iface_state->snapshot.last_amsdu_bytes = event->amsdu_bytes;
@@ -579,20 +622,20 @@ xqc_wifi_update_iface_state(xqc_wifi_monitor_t *monitor,
     iface_state->snapshot.sample_count++;
 
     if (iface_state->snapshot.sample_count == 1) {
-        iface_state->snapshot.ewma_gap_us = event->gap;
+        iface_state->snapshot.ewma_txop_interval_us = event->txop_interval_us;
         iface_state->snapshot.ewma_airtime_us = event->airtime;
         iface_state->snapshot.ewma_mac_rtt_us = event->mac_rtt_us;
         iface_state->snapshot.ewma_service_bytes = (double) service_bytes;
         iface_state->snapshot.ewma_service_time_us = service_time_us;
         iface_state->snapshot.ewma_burst_bytes =
             iface_state->snapshot.ewma_service_bytes;
-        iface_state->ewma_long_gap = long_gap;
+        iface_state->ewma_long_txop_interval = long_txop_interval;
         iface_state->snapshot.pi_degraded = 0.0;
 
     } else {
-        iface_state->snapshot.ewma_gap_us =
-            ewma_alpha * (double) event->gap
-            + (1.0 - ewma_alpha) * iface_state->snapshot.ewma_gap_us;
+        iface_state->snapshot.ewma_txop_interval_us =
+            ewma_alpha * (double) event->txop_interval_us
+            + (1.0 - ewma_alpha) * iface_state->snapshot.ewma_txop_interval_us;
         iface_state->snapshot.ewma_airtime_us =
             ewma_alpha * (double) event->airtime
             + (1.0 - ewma_alpha) * iface_state->snapshot.ewma_airtime_us;
@@ -607,12 +650,12 @@ xqc_wifi_update_iface_state(xqc_wifi_monitor_t *monitor,
             + (1.0 - ewma_alpha) * iface_state->snapshot.ewma_service_time_us;
         iface_state->snapshot.ewma_burst_bytes =
             iface_state->snapshot.ewma_service_bytes;
-        iface_state->ewma_long_gap =
-            ewma_alpha * (double) long_gap
-            + (1.0 - ewma_alpha) * iface_state->ewma_long_gap;
+        iface_state->ewma_long_txop_interval =
+            ewma_alpha * (double) long_txop_interval
+            + (1.0 - ewma_alpha) * iface_state->ewma_long_txop_interval;
     }
 
-    iface_state->snapshot.p_long_gap = iface_state->ewma_long_gap;
+    iface_state->snapshot.p_long_txop_interval = iface_state->ewma_long_txop_interval;
     if (iface_state->snapshot.ewma_service_time_us > 0.0) {
         iface_state->snapshot.service_rate_bytes_per_us =
             iface_state->snapshot.ewma_service_bytes
@@ -625,11 +668,11 @@ xqc_wifi_update_iface_state(xqc_wifi_monitor_t *monitor,
         + (1.0 - iface_state->snapshot.pi_degraded) * q01;
     pi_pred = xqc_wifi_clip_prob(pi_pred);
 
-    log_lr = long_gap ? log(p1 / p0) : log((1.0 - p1) / (1.0 - p0));
+    log_lr = long_txop_interval ? log(p1 / p0) : log((1.0 - p1) / (1.0 - p0));
     log_odds = log(pi_pred / (1.0 - pi_pred)) + log_lr;
     iface_state->snapshot.pi_degraded = 1.0 / (1.0 + exp(-log_odds));
 
-    xqc_wifi_gtsd_update(iface_state, event->gap);
+    xqc_wifi_gtsd_update(iface_state, event->txop_interval_us);
 
     xqc_wifi_emit_state_locked(monitor, iface_state, ts_us,
         iface_state->snapshot.state != old_state);
@@ -711,11 +754,11 @@ xqc_wifi_monitor_open_link_state(xqc_wifi_monitor_t *monitor)
     }
 
     fprintf(monitor->link_state_fp,
-        "ts_us,ifname,ifindex,state,sample_count,last_gap_us,"
+        "ts_us,ifname,ifindex,state,sample_count,last_txop_interval_us,"
         "last_mac_rtt_us,last_service_bytes,last_amsdu_subframes,"
-        "last_amsdu_bytes,ewma_gap_us,ewma_airtime_us,ewma_mac_rtt_us,"
+        "last_amsdu_bytes,ewma_txop_interval_us,ewma_airtime_us,ewma_mac_rtt_us,"
         "ewma_service_bytes,ewma_service_time_us,service_rate_bytes_per_us,"
-        "p_long_gap,pi_degraded,tail_p50_us,tail_p95_us,tail_ratio,"
+        "p_long_txop_interval,pi_degraded,tail_p50_us,tail_p95_us,tail_ratio,"
         "tail_baseline,tail_excess,cusum_on,cusum_off\n");
     return 0;
 }
@@ -801,6 +844,8 @@ xqc_wifi_monitor_write_meta(xqc_wifi_monitor_t *monitor)
     fprintf(fp, "  \"config_path\": \"%s\",\n", monitor->config_path);
     fprintf(fp, "  \"debug_packet_trace\": %s,\n",
         monitor->debug_packet_trace ? "true" : "false");
+    fprintf(fp, "  \"state_log_interval_us\": %llu,\n",
+        (unsigned long long) monitor->config.state_log_interval_us);
     fprintf(fp, "  \"link_state_path\": \"%s\",\n", monitor->link_state_path);
     fprintf(fp, "  \"ifname_primary\": \"%s\",\n",
         monitor->iface_count > 0 ? monitor->ifaces[0].ifname : "");
@@ -814,8 +859,8 @@ xqc_wifi_monitor_write_meta(xqc_wifi_monitor_t *monitor)
         (unsigned long long) monitor->rb_wifi_pkt_bad_size);
     fprintf(fp, "    \"state_update_attempts\": %llu,\n",
         (unsigned long long) monitor->state_update_attempts);
-    fprintf(fp, "    \"state_update_gap_zero\": %llu,\n",
-        (unsigned long long) monitor->state_update_gap_zero);
+    fprintf(fp, "    \"state_update_txop_interval_zero\": %llu,\n",
+        (unsigned long long) monitor->state_update_txop_interval_zero);
     fprintf(fp, "    \"state_update_unknown_ifindex\": %llu,\n",
         (unsigned long long) monitor->state_update_unknown_ifindex);
     fprintf(fp, "    \"state_update_accepted\": %llu,\n",
@@ -833,8 +878,8 @@ xqc_wifi_monitor_write_meta(xqc_wifi_monitor_t *monitor)
     fprintf(fp, "    \"last_poll_rc\": %d,\n", monitor->last_poll_rc);
     fprintf(fp, "    \"last_event_ifindex\": %llu,\n",
         (unsigned long long) monitor->last_event_ifindex);
-    fprintf(fp, "    \"last_event_gap_us\": %llu,\n",
-        (unsigned long long) monitor->last_event_gap_us);
+    fprintf(fp, "    \"last_event_txop_interval_us\": %llu,\n",
+        (unsigned long long) monitor->last_event_txop_interval_us);
     fprintf(fp, "    \"last_event_ampdu_len\": %llu,\n",
         (unsigned long long) monitor->last_event_ampdu_len);
     fprintf(fp, "    \"last_event_ampdu_ack_len\": %llu,\n",
@@ -1172,6 +1217,11 @@ xqc_wifi_monitor_start(xqc_wifi_monitor_t **monitor_out,
 
     pthread_mutex_init(&monitor->lock, NULL);
     monitor->config = *config;
+    monitor->config.state_log_interval_us =
+        xqc_wifi_normalize_log_interval_us(config->state_log_interval_us);
+    monitor->config.state_log_interval_us = xqc_wifi_normalize_log_interval_us(
+        xqc_wifi_parse_u64(getenv("XQC_WIFI_MONITOR_LOG_INTERVAL_US"),
+            monitor->config.state_log_interval_us));
     monitor->debug_packet_trace = config->debug_packet_trace
         || xqc_wifi_env_enabled("XQC_WIFI_MONITOR_PACKET_CSV");
     xqc_wifi_copy_cstr(monitor->output_dir, sizeof(monitor->output_dir), config->output_dir);

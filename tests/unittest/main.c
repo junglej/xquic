@@ -41,6 +41,8 @@
 #include "xqc_fec_scheme_test.h"
 #include "xqc_fec_test.h"
 #include "xqc_ack_with_timestamp_test.h"
+#include "xqc_scheduler_mac_aware_test.h"
+#include "xqc_send_ctl_test.h"
 
 static int xqc_init_suite(void) { return 0; }
 static int xqc_clean_suite(void) { return 0; }
@@ -106,6 +108,24 @@ main()
         || !CU_add_test(pSuite, "xqc_test_fec", xqc_test_fec)
 #endif
         || !CU_add_test(pSuite, "xqc_test_ack_with_timestamp", xqc_test_ack_with_timestamp)
+        || !CU_add_test(pSuite, "xqc_test_mac_aware_state_risk_detection",
+                        xqc_test_mac_aware_state_risk_detection)
+        || !CU_add_test(pSuite, "xqc_test_pto_uses_remote_max_ack_delay",
+                        xqc_test_pto_uses_remote_max_ack_delay)
+        || !CU_add_test(pSuite, "xqc_test_pto_remote_default_when_unset",
+                        xqc_test_pto_remote_default_when_unset)
+        || !CU_add_test(pSuite, "xqc_test_send_ctl_update_rtt_ack_delay_cap",
+                        xqc_test_send_ctl_update_rtt_ack_delay_cap)
+        || !CU_add_test(pSuite, "xqc_test_send_ctl_cwnd_usage_window_resets_after_ack",
+                        xqc_test_send_ctl_cwnd_usage_window_resets_after_ack)
+        || !CU_add_test(pSuite, "xqc_test_send_ctl_persistent_congestion_resets_rtt",
+                        xqc_test_send_ctl_persistent_congestion_resets_rtt)
+        || !CU_add_test(pSuite, "xqc_test_send_ctl_persistent_congestion_rtt_reseeds_from_new_sample",
+                        xqc_test_send_ctl_persistent_congestion_rtt_reseeds_from_new_sample)
+        || !CU_add_test(pSuite, "xqc_test_send_ctl_single_loss_does_not_reset_rtt",
+                        xqc_test_send_ctl_single_loss_does_not_reset_rtt)
+        || !CU_add_test(pSuite, "xqc_test_send_ctl_persistent_congestion_no_rtt_sample_early_return",
+                        xqc_test_send_ctl_persistent_congestion_no_rtt_sample_early_return)
         /* ADD TESTS HERE */) 
     {
         CU_cleanup_registry();

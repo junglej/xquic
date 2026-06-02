@@ -1228,6 +1228,17 @@ process:
                                   local_addr, local_addrlen);
         if (ret == XQC_OK) {
             conn->local_addrlen = local_addrlen;
+            if (conn->conn_initial_path != NULL
+                && conn->conn_initial_path->local_addrlen == 0)
+            {
+                ret = xqc_memcpy_with_cap(conn->conn_initial_path->local_addr,
+                                          sizeof(conn->conn_initial_path->local_addr),
+                                          local_addr, local_addrlen);
+                if (ret == XQC_OK) {
+                    conn->conn_initial_path->local_addrlen = local_addrlen;
+                    conn->conn_initial_path->addr_str_len = 0;
+                }
+            }
 
         } else {
             xqc_log(conn->log, XQC_LOG_ERROR, 

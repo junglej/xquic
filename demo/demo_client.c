@@ -784,9 +784,9 @@ xqc_demo_cli_open_aux_trace_files(xqc_demo_cli_ctx_t *ctx)
 
     ctx->wifi_state_fd = xqc_demo_cli_open_aux_csv(ctx->wifi_state_path,
         "ts_us,conn,path_id,path_seq,ifname,ifindex,wifi_state,"
-        "pi_degraded,p_long_gap,service_rate_bytes_per_us,last_gap_us,"
+        "pi_degraded,p_long_txop_interval,service_rate_bytes_per_us,last_txop_interval_us,"
         "last_mac_rtt_us,last_service_bytes,last_amsdu_subframes,"
-        "last_amsdu_bytes,ewma_gap_us,ewma_airtime_us,ewma_mac_rtt_us,"
+        "last_amsdu_bytes,ewma_txop_interval_us,ewma_airtime_us,ewma_mac_rtt_us,"
         "ewma_service_bytes,ewma_service_time_us,sample_count,"
         "last_update_ts_us,gtsd_calibrated,tail_p50_us,tail_p95_us,"
         "tail_ratio,tail_baseline,tail_excess,cusum_on,cusum_off");
@@ -802,25 +802,25 @@ xqc_demo_cli_open_aux_trace_files(xqc_demo_cli_ctx_t *ctx)
         "selected_ifindex,selected_on_degraded,other_cleaner,path0_id,"
         "path0_ifname,path0_ifindex,path0_srtt_us,path0_cwnd_bytes,"
         "path0_bytes_in_flight,path0_can_send,path0_path_state,"
-        "path0_app_status,path0_wifi_state,path0_pi,path0_p_long_gap,"
-        "path0_last_gap_us,path0_service_rate_bytes_per_us,"
+        "path0_app_status,path0_wifi_state,path0_pi,path0_p_long_txop_interval,"
+        "path0_last_txop_interval_us,path0_service_rate_bytes_per_us,"
         "path0_gtsd_calibrated,path0_tail_p50_us,path0_tail_p95_us,"
         "path0_tail_ratio,path0_tail_baseline,path0_tail_excess,"
         "path0_cusum_on,path0_cusum_off,path1_id,path1_ifname,"
         "path1_ifindex,path1_srtt_us,path1_cwnd_bytes,"
         "path1_bytes_in_flight,path1_can_send,path1_path_state,"
-        "path1_app_status,path1_wifi_state,path1_pi,path1_p_long_gap,"
-        "path1_last_gap_us,path1_service_rate_bytes_per_us,"
+        "path1_app_status,path1_wifi_state,path1_pi,path1_p_long_txop_interval,"
+        "path1_last_txop_interval_us,path1_service_rate_bytes_per_us,"
         "path1_gtsd_calibrated,path1_tail_p50_us,path1_tail_p95_us,"
         "path1_tail_ratio,path1_tail_baseline,path1_tail_excess,"
         "path1_cusum_on,path1_cusum_off,decision_reason,risk_reason,"
         "selected_pi,selected_tail_excess,selected_last_mac_rtt_us,"
-        "selected_ewma_mac_rtt_us,selected_ewma_gap_us,"
+        "selected_ewma_mac_rtt_us,selected_ewma_txop_interval_us,"
         "selected_ewma_airtime_us,selected_ewma_service_bytes,"
         "selected_service_rate_bytes_per_us,path0_last_mac_rtt_us,"
-        "path0_ewma_mac_rtt_us,path0_ewma_gap_us,path0_ewma_airtime_us,"
+        "path0_ewma_mac_rtt_us,path0_ewma_txop_interval_us,path0_ewma_airtime_us,"
         "path0_ewma_service_bytes,path1_last_mac_rtt_us,"
-        "path1_ewma_mac_rtt_us,path1_ewma_gap_us,path1_ewma_airtime_us,"
+        "path1_ewma_mac_rtt_us,path1_ewma_txop_interval_us,path1_ewma_airtime_us,"
         "path1_ewma_service_bytes,path0_scheduler_high_risk,"
         "path0_scheduler_risk_reason,path1_scheduler_high_risk,"
         "path1_scheduler_risk_reason,base_candidate_ifname,"
@@ -1030,14 +1030,14 @@ xqc_demo_cli_log_wifi_state_snapshot(xqc_demo_cli_ctx_t *ctx,
         snapshot->ifindex,
         xqc_demo_cli_wifi_state_label(snapshot->state),
         snapshot->pi_degraded,
-        snapshot->p_long_gap,
+        snapshot->p_long_txop_interval,
         snapshot->service_rate_bytes_per_us,
-        snapshot->last_gap_us,
+        snapshot->last_txop_interval_us,
         snapshot->last_mac_rtt_us,
         snapshot->last_service_bytes,
         snapshot->last_amsdu_subframes,
         snapshot->last_amsdu_bytes,
-        snapshot->ewma_gap_us,
+        snapshot->ewma_txop_interval_us,
         snapshot->ewma_airtime_us,
         snapshot->ewma_mac_rtt_us,
         snapshot->ewma_service_bytes,
@@ -1228,8 +1228,8 @@ xqc_demo_cli_scheduler_observer_cb(const xqc_scheduler_observation_t *observatio
         rows[0].app_path_status,
         rows[0].has_wifi_snapshot ? xqc_demo_cli_wifi_state_label(rows[0].wifi_snapshot.state) : "UNKNOWN",
         rows[0].has_wifi_snapshot ? rows[0].wifi_snapshot.pi_degraded : 0.0,
-        rows[0].has_wifi_snapshot ? rows[0].wifi_snapshot.p_long_gap : 0.0,
-        rows[0].has_wifi_snapshot ? rows[0].wifi_snapshot.last_gap_us : 0,
+        rows[0].has_wifi_snapshot ? rows[0].wifi_snapshot.p_long_txop_interval : 0.0,
+        rows[0].has_wifi_snapshot ? rows[0].wifi_snapshot.last_txop_interval_us : 0,
         rows[0].has_wifi_snapshot
             ? rows[0].wifi_snapshot.service_rate_bytes_per_us : 0.0,
         rows[0].has_wifi_snapshot ? (unsigned) rows[0].wifi_snapshot.gtsd_calibrated : 0,
@@ -1251,8 +1251,8 @@ xqc_demo_cli_scheduler_observer_cb(const xqc_scheduler_observation_t *observatio
         rows[1].app_path_status,
         rows[1].has_wifi_snapshot ? xqc_demo_cli_wifi_state_label(rows[1].wifi_snapshot.state) : "UNKNOWN",
         rows[1].has_wifi_snapshot ? rows[1].wifi_snapshot.pi_degraded : 0.0,
-        rows[1].has_wifi_snapshot ? rows[1].wifi_snapshot.p_long_gap : 0.0,
-        rows[1].has_wifi_snapshot ? rows[1].wifi_snapshot.last_gap_us : 0,
+        rows[1].has_wifi_snapshot ? rows[1].wifi_snapshot.p_long_txop_interval : 0.0,
+        rows[1].has_wifi_snapshot ? rows[1].wifi_snapshot.last_txop_interval_us : 0,
         rows[1].has_wifi_snapshot
             ? rows[1].wifi_snapshot.service_rate_bytes_per_us : 0.0,
         rows[1].has_wifi_snapshot ? (unsigned) rows[1].wifi_snapshot.gtsd_calibrated : 0,
@@ -1274,7 +1274,7 @@ xqc_demo_cli_scheduler_observer_cb(const xqc_scheduler_observation_t *observatio
         selected_idx >= 0 && rows[selected_idx].has_wifi_snapshot
             ? rows[selected_idx].wifi_snapshot.ewma_mac_rtt_us : 0.0,
         selected_idx >= 0 && rows[selected_idx].has_wifi_snapshot
-            ? rows[selected_idx].wifi_snapshot.ewma_gap_us : 0.0,
+            ? rows[selected_idx].wifi_snapshot.ewma_txop_interval_us : 0.0,
         selected_idx >= 0 && rows[selected_idx].has_wifi_snapshot
             ? rows[selected_idx].wifi_snapshot.ewma_airtime_us : 0.0,
         selected_idx >= 0 && rows[selected_idx].has_wifi_snapshot
@@ -1283,12 +1283,12 @@ xqc_demo_cli_scheduler_observer_cb(const xqc_scheduler_observation_t *observatio
             ? rows[selected_idx].wifi_snapshot.service_rate_bytes_per_us : 0.0,
         rows[0].has_wifi_snapshot ? rows[0].wifi_snapshot.last_mac_rtt_us : 0,
         rows[0].has_wifi_snapshot ? rows[0].wifi_snapshot.ewma_mac_rtt_us : 0.0,
-        rows[0].has_wifi_snapshot ? rows[0].wifi_snapshot.ewma_gap_us : 0.0,
+        rows[0].has_wifi_snapshot ? rows[0].wifi_snapshot.ewma_txop_interval_us : 0.0,
         rows[0].has_wifi_snapshot ? rows[0].wifi_snapshot.ewma_airtime_us : 0.0,
         rows[0].has_wifi_snapshot ? rows[0].wifi_snapshot.ewma_service_bytes : 0.0,
         rows[1].has_wifi_snapshot ? rows[1].wifi_snapshot.last_mac_rtt_us : 0,
         rows[1].has_wifi_snapshot ? rows[1].wifi_snapshot.ewma_mac_rtt_us : 0.0,
-        rows[1].has_wifi_snapshot ? rows[1].wifi_snapshot.ewma_gap_us : 0.0,
+        rows[1].has_wifi_snapshot ? rows[1].wifi_snapshot.ewma_txop_interval_us : 0.0,
         rows[1].has_wifi_snapshot ? rows[1].wifi_snapshot.ewma_airtime_us : 0.0,
         rows[1].has_wifi_snapshot ? rows[1].wifi_snapshot.ewma_service_bytes : 0.0,
         (unsigned) rows[0].scheduler_high_risk,

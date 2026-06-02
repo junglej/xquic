@@ -99,6 +99,8 @@ typedef struct xqc_path_send_availability_stats_s {
     uint64_t            send_burst_eagain_requested_pkts;
     uint64_t            send_burst_eagain_requested_bytes;
     uint64_t            send_burst_socket_error;
+    uint64_t            send_packet_eagain;
+    uint64_t            send_packet_socket_error;
 } xqc_path_send_availability_stats_t;
 
 /* path context */
@@ -225,7 +227,8 @@ void xqc_path_schedule_buf_pre_destroy(xqc_send_queue_t *send_queue, xqc_path_ct
 
 /* create path inner */
 xqc_path_ctx_t *xqc_conn_create_path_inner(xqc_connection_t *conn, 
-    xqc_cid_t *scid, xqc_cid_t *dcid, xqc_app_path_status_t path_status, uint64_t path_id);
+    xqc_cid_t *scid, xqc_cid_t *dcid, xqc_app_path_status_t path_status, uint64_t path_id,
+    const struct sockaddr *local_addr, socklen_t local_addrlen);
 
 /* server update client addr when recv path_challenge frame */
 xqc_int_t xqc_conn_server_init_path_addr(xqc_connection_t *conn, uint64_t path_id,
@@ -281,4 +284,3 @@ double xqc_path_recent_loss_rate(xqc_path_ctx_t *path);
 double xqc_conn_recent_loss_rate(xqc_connection_t *conn);
 
 #endif /* XQC_MULTIPATH_H */
-

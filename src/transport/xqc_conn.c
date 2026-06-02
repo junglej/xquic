@@ -39,6 +39,7 @@
 #include <openssl/rand.h>
 
 #define XQC_DEFAULT_MAX_STREAMS     1024
+#define XQC_PATH_SEND_RETRY_DELAY   1000 /* us */
 
 xqc_conn_settings_t internal_default_conn_settings = {
     .pacing_on                  = 0,
@@ -2507,6 +2508,12 @@ xqc_path_send_packets(xqc_connection_t *conn, xqc_path_ctx_t *path,
 
         ret = xqc_path_send_one_packet(conn, path, packet_out);
         if (ret < 0) {
+            if (ret == -XQC_EAGAIN) {
+                path->send_avail_stats.send_packet_eagain++;
+
+            } else {
+                path->send_avail_stats.send_packet_socket_error++;
+            }
             break;
         }
 
@@ -3830,6 +3837,7 @@ xqc_conn_send_availability_info_print(xqc_connection_t *conn,
                        "burst_partial=%"PRIu64",partial_unsent_pkts=%"PRIu64","
                        "burst_eagain=%"PRIu64",eagain_req_pkts=%"PRIu64","
                        "eagain_req_bytes=%"PRIu64",socket_error=%"PRIu64","
+                       "pkt_eagain=%"PRIu64",pkt_socket_error=%"PRIu64","
                        "loss=%u,tlp=%u",
                        curr_size == 0 ? "" : ";",
                        path->path_id,
@@ -3847,6 +3855,8 @@ xqc_conn_send_availability_info_print(xqc_connection_t *conn,
                        stats->send_burst_eagain_requested_pkts,
                        stats->send_burst_eagain_requested_bytes,
                        stats->send_burst_socket_error,
+                       stats->send_packet_eagain,
+                       stats->send_packet_socket_error,
                        loss_cnt,
                        tlp_cnt);
 
@@ -4774,6 +4784,7 @@ xqc_conn_next_wakeup_time(xqc_connection_t *conn)
 {
     xqc_usec_t min_time = XQC_MAX_UINT64_VALUE;
     xqc_usec_t wakeup_time;
+    xqc_bool_t has_retryable_path_packets = XQC_FALSE;
     xqc_timer_t *timer;
 
     for (xqc_timer_type_t type = 0; type < XQC_TIMER_N; ++type) {
@@ -4807,6 +4818,27 @@ xqc_conn_next_wakeup_time(xqc_connection_t *conn)
                 min_time = xqc_min(min_time, timer->expire_time);
             }
         }
+
+        if (path->path_send_ctl != NULL
+            && path->path_send_ctl->ctl_bytes_in_flight == 0)
+        {
+            for (xqc_send_type_t type = 0; type < XQC_SEND_TYPE_N; type++) {
+                if (!xqc_list_empty(&path->path_schedule_buf[type])) {
+                    has_retryable_path_packets = XQC_TRUE;
+                    break;
+                }
+            }
+        }
+    }
+
+    /*
+     * A socket EAGAIN leaves packets in path_schedule_buf.  If all inflight data
+     * on that path has drained and no other timer is earlier, retry soon instead
+     * of waiting for the idle timer.
+     */
+    if (has_retryable_path_packets) {
+        min_time = xqc_min(min_time,
+                           xqc_monotonic_timestamp() + XQC_PATH_SEND_RETRY_DELAY);
     }
 
     wakeup_time = min_time == XQC_MAX_UINT64_VALUE ? 0 : min_time;

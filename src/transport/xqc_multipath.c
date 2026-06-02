@@ -185,7 +185,7 @@ xqc_path_init(xqc_path_ctx_t *path, xqc_connection_t *conn)
         path->peer_addrlen = conn->peer_addrlen;
     }
 
-    if (conn->local_addrlen > 0) {
+    if (path->local_addrlen == 0 && conn->local_addrlen > 0) {
         xqc_memcpy(path->local_addr, conn->local_addr, conn->local_addrlen);
         path->local_addrlen = conn->local_addrlen;
     }
@@ -428,7 +428,9 @@ xqc_conn_is_current_mp_version_supported(xqc_multipath_version_t mp_version)
 }
 
 xqc_int_t
-xqc_conn_create_path(xqc_engine_t *engine, const xqc_cid_t *scid, uint64_t *new_path_id, int path_status)
+xqc_conn_create_path_with_addr(xqc_engine_t *engine, const xqc_cid_t *scid,
+    uint64_t *new_path_id, int path_status, const struct sockaddr *local_addr,
+    socklen_t local_addrlen)
 {
     xqc_connection_t *conn = NULL;
     xqc_path_ctx_t *path = NULL;
@@ -465,7 +467,8 @@ xqc_conn_create_path(xqc_engine_t *engine, const xqc_cid_t *scid, uint64_t *new_
         ps_inner = XQC_APP_PATH_STATUS_STANDBY;
     }
 
-    path = xqc_conn_create_path_inner(conn, NULL, NULL, ps_inner, path_id);
+    path = xqc_conn_create_path_inner(conn, NULL, NULL, ps_inner, path_id,
+                                      local_addr, local_addrlen);
     if (path == NULL) {
         xqc_log(conn->log, XQC_LOG_ERROR, "|xqc_path_create error|%ui|", path_id);
         return -XQC_EMP_CREATE_PATH;
@@ -479,6 +482,12 @@ xqc_conn_create_path(xqc_engine_t *engine, const xqc_cid_t *scid, uint64_t *new_
     *new_path_id = path->path_id;
 
     return XQC_OK;
+}
+
+xqc_int_t
+xqc_conn_create_path(xqc_engine_t *engine, const xqc_cid_t *scid, uint64_t *new_path_id, int path_status)
+{
+    return xqc_conn_create_path_with_addr(engine, scid, new_path_id, path_status, NULL, 0);
 }
 
 xqc_int_t
@@ -542,7 +551,8 @@ xqc_conn_init_paths_list(xqc_connection_t *conn)
     conn->conn_initial_path = xqc_conn_create_path_inner(conn,
                                                          &conn->scid_set.user_scid,
                                                          &conn->dcid_set.current_dcid,
-                                                         XQC_APP_PATH_STATUS_AVAILABLE, 0);
+                                                         XQC_APP_PATH_STATUS_AVAILABLE, 0,
+                                                         NULL, 0);
     if (conn->conn_initial_path == NULL) {
         xqc_log(conn->log, XQC_LOG_ERROR, "|xqc_conn_create_path_inner fail|");
         return -XQC_EMP_CREATE_PATH;
@@ -605,7 +615,8 @@ xqc_conn_find_path_by_scid(xqc_connection_t *conn, xqc_cid_t *scid)
 
 xqc_path_ctx_t *
 xqc_conn_create_path_inner(xqc_connection_t *conn,
-    xqc_cid_t *scid, xqc_cid_t *dcid, xqc_app_path_status_t path_status, uint64_t path_id)
+    xqc_cid_t *scid, xqc_cid_t *dcid, xqc_app_path_status_t path_status, uint64_t path_id,
+    const struct sockaddr *local_addr, socklen_t local_addrlen)
 {
     xqc_int_t ret = XQC_ERROR;
     xqc_path_ctx_t *path = NULL;
@@ -617,6 +628,19 @@ xqc_conn_create_path_inner(xqc_connection_t *conn,
     }
 
     path->app_path_status = path_status;
+
+    if (local_addr != NULL && local_addrlen > 0) {
+        ret = xqc_memcpy_with_cap(path->local_addr, sizeof(path->local_addr),
+                                  local_addr, local_addrlen);
+        if (ret == XQC_OK) {
+            path->local_addrlen = local_addrlen;
+
+        } else {
+            xqc_log(conn->log, XQC_LOG_ERROR,
+                    "|path local addr too large|addr_len:%d|", (int)local_addrlen);
+            return NULL;
+        }
+    }
 
     ret = xqc_path_init(path, conn);
     if (ret != XQC_OK) {
@@ -644,23 +668,73 @@ xqc_conn_path_metrics_print(xqc_connection_t *conn, xqc_conn_stats_t *stats)
     xqc_list_for_each_safe(pos, next, &conn->conn_paths_list) {
         path = xqc_list_entry(pos, xqc_path_ctx_t, path_list);
         if (path->path_state >= XQC_PATH_STATE_ACTIVE && paths_num < XQC_MAX_PATHS_COUNT) {
+            xqc_send_ctl_t *send_ctl;
+            uint64_t cwnd = 0;
+            uint64_t actual_mss;
+            uint8_t cwnd_limited;
+            uint8_t pacing_limited;
 
             if (path == NULL || path->path_send_ctl == NULL) {
                 continue;
             }
 
+            send_ctl = path->path_send_ctl;
+            if (send_ctl->ctl_cong_callback != NULL
+                && send_ctl->ctl_cong_callback->xqc_cong_ctl_get_cwnd != NULL)
+            {
+                cwnd = send_ctl->ctl_cong_callback->xqc_cong_ctl_get_cwnd(
+                    send_ctl->ctl_cong);
+            }
+            actual_mss = conn->conn_settings.max_pkt_out_size > 0
+                         ? conn->conn_settings.max_pkt_out_size
+                         : XQC_PACKET_OUT_SIZE;
+            cwnd_limited = (cwnd > 0
+                            && send_ctl->ctl_bytes_in_flight + actual_mss > cwnd)
+                           ? 1 : 0;
+            pacing_limited = (xqc_pacing_is_on(&send_ctl->ctl_pacing)
+                              && send_ctl->ctl_pacing.bytes_budget < actual_mss)
+                             ? 1 : 0;
+
             stats->paths_info[paths_num].path_id = path->path_id;
-            stats->paths_info[paths_num].path_pkt_recv_count = path->path_send_ctl->ctl_recv_count;
-            stats->paths_info[paths_num].path_pkt_send_count = path->path_send_ctl->ctl_send_count;
-            stats->paths_info[paths_num].path_send_bytes = path->path_send_ctl->ctl_app_bytes_send;
-            stats->paths_info[paths_num].path_recv_bytes = path->path_send_ctl->ctl_app_bytes_recv;
+            stats->paths_info[paths_num].path_state = path->path_state;
+            stats->paths_info[paths_num].path_pkt_recv_count = send_ctl->ctl_recv_count;
+            stats->paths_info[paths_num].path_pkt_send_count = send_ctl->ctl_send_count;
+            stats->paths_info[paths_num].path_send_bytes = send_ctl->ctl_app_bytes_send;
+            stats->paths_info[paths_num].path_recv_bytes = send_ctl->ctl_app_bytes_recv;
             stats->paths_info[paths_num].path_app_status = path->app_path_status;
+            stats->paths_info[paths_num].path_srtt = send_ctl->ctl_srtt;
+            stats->paths_info[paths_num].path_latest_rtt = send_ctl->ctl_latest_rtt;
+            stats->paths_info[paths_num].path_rttvar = send_ctl->ctl_rttvar;
+            stats->paths_info[paths_num].path_cwnd_bytes = cwnd;
+            stats->paths_info[paths_num].path_bytes_in_flight = send_ctl->ctl_bytes_in_flight;
+            stats->paths_info[paths_num].path_pacing_rate_bytes_per_s =
+                xqc_send_ctl_get_pacing_rate(send_ctl);
+            stats->paths_info[paths_num].path_pacing_budget_bytes =
+                send_ctl->ctl_pacing.bytes_budget;
+            stats->paths_info[paths_num].path_sched_pkts =
+                path->send_avail_stats.scheduler_selected_pkts;
+            stats->paths_info[paths_num].path_sched_bytes =
+                path->send_avail_stats.scheduler_selected_bytes;
+            stats->paths_info[paths_num].path_sched_cwnd_full =
+                path->send_avail_stats.scheduler_selected_cwnd_full;
+            stats->paths_info[paths_num].path_loss_count = send_ctl->ctl_lost_count;
+            stats->paths_info[paths_num].path_tlp_count = send_ctl->ctl_tlp_count;
+            stats->paths_info[paths_num].path_pacing_on =
+                xqc_pacing_is_on(&send_ctl->ctl_pacing) ? 1 : 0;
+            stats->paths_info[paths_num].path_cwnd_limited = cwnd_limited;
+            stats->paths_info[paths_num].path_pacing_limited = pacing_limited;
+            stats->paths_info[paths_num].path_app_limited =
+                send_ctl->ctl_app_limited > 0 ? 1 : 0;
+            stats->paths_info[paths_num].path_can_send =
+                path->path_state >= XQC_PATH_STATE_ACTIVE
+                && path->app_path_status == XQC_APP_PATH_STATUS_AVAILABLE
+                && !cwnd_limited && !pacing_limited;
 
             if (path->app_path_status == XQC_APP_PATH_STATUS_STANDBY) {
-                stats->standby_path_app_bytes += path->path_send_ctl->ctl_app_bytes_send + path->path_send_ctl->ctl_app_bytes_recv;
+                stats->standby_path_app_bytes += send_ctl->ctl_app_bytes_send + send_ctl->ctl_app_bytes_recv;
             }
 
-            stats->total_app_bytes += path->path_send_ctl->ctl_app_bytes_send + path->path_send_ctl->ctl_app_bytes_recv;
+            stats->total_app_bytes += send_ctl->ctl_app_bytes_send + send_ctl->ctl_app_bytes_recv;
 
             paths_num++;
         }

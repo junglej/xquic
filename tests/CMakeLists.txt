@@ -124,6 +124,8 @@ if(HAVE_CUNIT)
         ${UNIT_TEST_DIR}/xqc_datagram_test.c
         ${UNIT_TEST_DIR}/xqc_h3_ext_test.c
         ${UNIT_TEST_DIR}/xqc_ack_with_timestamp_test.c
+        ${UNIT_TEST_DIR}/xqc_scheduler_mac_aware_test.c
+        ${UNIT_TEST_DIR}/xqc_send_ctl_test.c
     )
 
     if(XQC_ENABLE_FEC)

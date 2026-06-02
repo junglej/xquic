@@ -1619,7 +1619,9 @@ xqc_process_path_challenge_frame(xqc_connection_t *conn, xqc_packet_in_t *packet
     if (path == NULL) {
         if (conn->conn_type == XQC_CONN_TYPE_SERVER) {
             /* try to create new path */
-            path = xqc_conn_create_path_inner(conn, &packet_in->pi_pkt.pkt_dcid, NULL, XQC_APP_PATH_STATUS_AVAILABLE, packet_in->pi_path_id);
+            path = xqc_conn_create_path_inner(conn, &packet_in->pi_pkt.pkt_dcid, NULL,
+                                              XQC_APP_PATH_STATUS_AVAILABLE, packet_in->pi_path_id,
+                                              NULL, 0);
             if (path == NULL) {
                 xqc_log(conn->log, XQC_LOG_ERROR, "|xqc_conn_create_path_inner err|%ui|", packet_in->pi_path_id);
                 return -XQC_EMP_CREATE_PATH;

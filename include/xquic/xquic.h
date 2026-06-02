@@ -1565,6 +1565,7 @@ typedef enum {
 
 typedef struct xqc_path_metrics_s {
     uint64_t            path_id;
+    uint8_t             path_state;
 
     uint64_t            path_pkt_recv_count;
     uint64_t            path_pkt_send_count;
@@ -1578,7 +1579,23 @@ typedef struct xqc_path_metrics_s {
     uint64_t            path_recv_effective_reinject_bytes;
 
     uint64_t            path_srtt;
+    uint64_t            path_latest_rtt;
+    uint64_t            path_rttvar;
+    uint64_t            path_cwnd_bytes;
+    uint64_t            path_bytes_in_flight;
+    uint64_t            path_pacing_rate_bytes_per_s;
+    uint64_t            path_pacing_budget_bytes;
+    uint64_t            path_sched_pkts;
+    uint64_t            path_sched_bytes;
+    uint64_t            path_sched_cwnd_full;
+    uint64_t            path_loss_count;
+    uint64_t            path_tlp_count;
     uint8_t             path_app_status;
+    uint8_t             path_pacing_on;
+    uint8_t             path_can_send;
+    uint8_t             path_cwnd_limited;
+    uint8_t             path_pacing_limited;
+    uint8_t             path_app_limited;
 } xqc_path_metrics_t;
 
 /**
@@ -2178,6 +2195,12 @@ XQC_EXPORT_PUBLIC_API
 xqc_int_t xqc_conn_create_path(xqc_engine_t *engine,
     const xqc_cid_t *cid, uint64_t *new_path_id,
     int path_status);
+
+XQC_EXPORT_PUBLIC_API
+xqc_int_t xqc_conn_create_path_with_addr(xqc_engine_t *engine,
+    const xqc_cid_t *cid, uint64_t *new_path_id,
+    int path_status, const struct sockaddr *local_addr,
+    socklen_t local_addrlen);
 
 
 /**

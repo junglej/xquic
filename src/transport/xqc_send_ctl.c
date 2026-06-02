@@ -22,6 +22,9 @@
 #include "src/transport/xqc_datagram.h"
 #include "src/transport/xqc_reinjection.h"
 #include "src/transport/xqc_transport_trace.h"
+#include "src/transport/xqc_transport_params.h"
+
+#define XQC_SEND_CTL_MVFST_ENABLE_HEADROOM_CWND_LIMITED 1
 
 int 
 xqc_send_ctl_may_remove_unacked_dgram(xqc_connection_t *conn, xqc_packet_out_t *po)
@@ -107,6 +110,15 @@ xqc_send_ctl_indirectly_ack_or_drop_po(xqc_connection_t *conn, xqc_packet_out_t 
     return XQC_FALSE;
 }
 
+static void
+xqc_send_ctl_reset_cwnd_usage(xqc_send_ctl_t *send_ctl)
+{
+    send_ctl->ctl_max_bytes_in_flight = 0;
+    send_ctl->ctl_cwnd_usage_end_pn = 0;
+    send_ctl->ctl_cwnd_usage_pns = XQC_PNS_N;
+    send_ctl->ctl_cwnd_usage_valid = 0;
+}
+
 
 xqc_send_ctl_t *
 xqc_send_ctl_create(xqc_path_ctx_t *path)
@@ -127,7 +139,7 @@ xqc_send_ctl_create(xqc_path_ctx_t *path)
     send_ctl->ctl_srtt = conn->conn_settings.initial_rtt;
     send_ctl->ctl_rttvar = send_ctl->ctl_srtt / 2;
     send_ctl->ctl_latest_rtt = 0;
-    send_ctl->ctl_max_bytes_in_flight = 0;
+    xqc_send_ctl_reset_cwnd_usage(send_ctl);
     send_ctl->ctl_reordering_packet_threshold = conn->conn_settings.loss_detection_pkt_thresh;
     send_ctl->ctl_reordering_time_threshold_shift = XQC_kTimeThresholdShift;
     send_ctl->ctl_first_rtt_sample_time = 0;
@@ -212,7 +224,7 @@ xqc_send_ctl_reset(xqc_send_ctl_t *send_ctl)
     send_ctl->ctl_minrtt = XQC_MAX_UINT32_VALUE;
     send_ctl->ctl_srtt = conn->conn_settings.initial_rtt;
     send_ctl->ctl_rttvar = send_ctl->ctl_srtt / 2;
-    send_ctl->ctl_max_bytes_in_flight = 0;
+    xqc_send_ctl_reset_cwnd_usage(send_ctl);
     send_ctl->ctl_reordering_packet_threshold = XQC_kPacketThreshold;
     send_ctl->ctl_reordering_time_threshold_shift = XQC_kTimeThresholdShift;
     send_ctl->ctl_ack_sent_cnt = 0;
@@ -422,18 +434,20 @@ xqc_send_ctl_can_send(xqc_send_ctl_t *send_ctl, xqc_packet_out_t *packet_out, ui
     xqc_connection_t *conn = send_ctl->ctl_conn;
 
     int can = 1;
-    unsigned congestion_window = send_ctl->ctl_cong_callback->xqc_cong_ctl_get_cwnd(send_ctl->ctl_cong);
+    uint64_t congestion_window = send_ctl->ctl_cong_callback->xqc_cong_ctl_get_cwnd(send_ctl->ctl_cong);
+    uint64_t pending_bytes = (uint64_t)send_ctl->ctl_bytes_in_flight
+                             + schedule_bytes + packet_out->po_used_size;
 
     if (conn->conn_settings.so_sndbuf > 0) {
         congestion_window = xqc_min(congestion_window, conn->conn_settings.so_sndbuf);
     }
 
-    if (send_ctl->ctl_bytes_in_flight + schedule_bytes + packet_out->po_used_size > congestion_window) {
+    if (pending_bytes > congestion_window) {
         can = 0;
     }
 
     xqc_conn_log(conn, XQC_LOG_DEBUG,
-                 "|path:%ui|can:%d|pkt_sz:%ud|schedule_bytes:%ud|inflight:%ud|cwnd:%ud|conn:%p|stream_id:%ui|stream_offset:%ui|",
+                 "|path:%ui|can:%d|pkt_sz:%ud|schedule_bytes:%ud|inflight:%ud|cwnd:%ui|conn:%p|stream_id:%ui|stream_offset:%ui|",
                  send_ctl->ctl_path->path_id,
                  can, packet_out->po_used_size, schedule_bytes, send_ctl->ctl_bytes_in_flight,
                  congestion_window, conn,
@@ -617,20 +631,62 @@ xqc_send_ctl_on_pns_discard(xqc_send_ctl_t *send_ctl, xqc_pkt_num_space_t pns)
 }
 
 
-static void 
-xqc_send_ctl_update_cwnd_limited(xqc_send_ctl_t *send_ctl, xqc_usec_t now)
+static xqc_bool_t
+xqc_send_ctl_cwnd_usage_window_acked(xqc_send_ctl_t *send_ctl, xqc_pkt_num_space_t pns)
 {
-    if (send_ctl->ctl_bytes_in_flight > send_ctl->ctl_max_bytes_in_flight) {
+    if (!send_ctl->ctl_cwnd_usage_valid
+        || pns >= XQC_PNS_N
+        || send_ctl->ctl_cwnd_usage_pns != pns)
+    {
+        return XQC_FALSE;
+    }
+
+    xqc_packet_number_t largest_acked = send_ctl->ctl_largest_acked[pns];
+    return largest_acked != XQC_MAX_UINT64_VALUE
+           && largest_acked >= send_ctl->ctl_cwnd_usage_end_pn;
+}
+
+void
+xqc_send_ctl_update_cwnd_limited(xqc_send_ctl_t *send_ctl, xqc_packet_out_t *packet_out, xqc_usec_t now)
+{
+    xqc_pkt_num_space_t pns = packet_out->po_pkt.pkt_pns;
+    uint64_t cwnd_bytes = send_ctl->ctl_cong_callback->xqc_cong_ctl_get_cwnd(send_ctl->ctl_cong);
+#if XQC_SEND_CTL_MVFST_ENABLE_HEADROOM_CWND_LIMITED
+    xqc_bool_t cwnd_limited = send_ctl->ctl_bytes_in_flight >= (cwnd_bytes >> 1);
+#else
+    uint32_t actual_mss = xqc_conn_get_mss(send_ctl->ctl_conn);
+    xqc_bool_t cwnd_limited = send_ctl->ctl_bytes_in_flight + actual_mss > cwnd_bytes;
+#endif
+
+    if (!send_ctl->ctl_cwnd_usage_valid
+        || pns != send_ctl->ctl_cwnd_usage_pns
+        || xqc_send_ctl_cwnd_usage_window_acked(send_ctl, pns)
+        || cwnd_limited)
+    {
+        send_ctl->ctl_max_bytes_in_flight = send_ctl->ctl_bytes_in_flight;
+
+        if (pns < XQC_PNS_N) {
+            send_ctl->ctl_cwnd_usage_end_pn = packet_out->po_pkt.pkt_num;
+            send_ctl->ctl_cwnd_usage_pns = pns;
+            send_ctl->ctl_cwnd_usage_valid = 1;
+        }
+
+    } else if (send_ctl->ctl_bytes_in_flight > send_ctl->ctl_max_bytes_in_flight) {
         send_ctl->ctl_max_bytes_in_flight = send_ctl->ctl_bytes_in_flight;
     }
-    uint32_t cwnd_bytes = send_ctl->ctl_cong_callback->xqc_cong_ctl_get_cwnd(send_ctl->ctl_cong);
-    /* If we can not send the next full-size packet, we are CWND limited. */
-    xqc_log(send_ctl->ctl_conn->log, XQC_LOG_DEBUG, "|path:%ui|cwnd:%ud|inflight:%ud|",
-            send_ctl->ctl_path->path_id, cwnd_bytes, send_ctl->ctl_bytes_in_flight);
+
+    xqc_log(send_ctl->ctl_conn->log, XQC_LOG_DEBUG,
+            "|path:%ui|cwnd:%ui|inflight:%ud|max_inflight:%ud|"
+            "cwnd_usage_valid:%d|cwnd_usage_pns:%d|cwnd_usage_end_pn:%ui|",
+            send_ctl->ctl_path->path_id, cwnd_bytes,
+            send_ctl->ctl_bytes_in_flight,
+            send_ctl->ctl_max_bytes_in_flight,
+            send_ctl->ctl_cwnd_usage_valid,
+            send_ctl->ctl_cwnd_usage_pns,
+            send_ctl->ctl_cwnd_usage_end_pn);
       
     send_ctl->ctl_is_cwnd_limited = 0;
-    uint32_t actual_mss = xqc_conn_get_mss(send_ctl->ctl_conn);
-    if ((send_ctl->ctl_bytes_in_flight + actual_mss) > cwnd_bytes) {
+    if (cwnd_limited) {
         send_ctl->ctl_is_cwnd_limited = 1;
         /* record the time of cwnd limited */
         send_ctl->ctl_recent_cwnd_limitation_time[send_ctl->ctl_cwndlim_update_idx] = now;
@@ -790,7 +846,7 @@ xqc_send_ctl_on_packet_sent(xqc_send_ctl_t *send_ctl, xqc_pn_ctl_t *pn_ctl, xqc_
         xqc_stream_path_metrics_on_send(send_ctl->ctl_conn, packet_out);
 
         send_ctl->ctl_last_inflight_pkt_sent_time = now;
-        xqc_send_ctl_update_cwnd_limited(send_ctl, now);
+        xqc_send_ctl_update_cwnd_limited(send_ctl, packet_out, now);
     }
 
     if (packet_out->po_frame_types & XQC_FRAME_BIT_CONNECTION_CLOSE) {
@@ -1228,8 +1284,15 @@ xqc_send_ctl_update_rtt(xqc_send_ctl_t *send_ctl, xqc_usec_t *latest_rtt, xqc_us
     } else {
         send_ctl->ctl_minrtt = xqc_min(*latest_rtt, send_ctl->ctl_minrtt);
 
+        /*
+         * RFC 9002 5.3: cap ack_delay before subtracting it from latest_rtt.
+         * Before handshake confirmation, use the default max_ack_delay cap.
+         */
         if (xqc_conn_is_handshake_confirmed(send_ctl->ctl_conn)) {
             ack_delay = xqc_min(ack_delay, send_ctl->ctl_conn->remote_settings.max_ack_delay * 1000);
+
+        } else {
+            ack_delay = xqc_min(ack_delay, XQC_DEFAULT_MAX_ACK_DELAY * 1000);
         }
 
         /* Adjust for ack delay if it's plausible. */
@@ -1476,9 +1539,24 @@ xqc_send_ctl_detect_lost(xqc_send_ctl_t *send_ctl, xqc_send_queue_t *send_queue,
             && xqc_send_ctl_in_persistent_congestion(send_ctl, largest_lost, now))
         {
             /* For loss-based CCs, it means we are gonna slow start again. */
-            send_ctl->ctl_max_bytes_in_flight = 0;
+            xqc_send_ctl_reset_cwnd_usage(send_ctl);
+
+            /*
+             * Reset the per-path RTT estimator after persistent congestion so
+             * the next RTT sample can re-seed it instead of smoothing against
+             * stale path conditions.
+             */
+            xqc_log(conn->log, XQC_LOG_DEBUG,
+                    "|OnLostDetection|persistent_congestion|reset_rtt"
+                    "|old_srtt:%ui|old_rttvar:%ui|old_minrtt:%ui|",
+                    send_ctl->ctl_srtt, send_ctl->ctl_rttvar,
+                    send_ctl->ctl_minrtt);
+            send_ctl->ctl_minrtt = XQC_MAX_UINT32_VALUE;
+            send_ctl->ctl_srtt = send_ctl->ctl_conn->conn_settings.initial_rtt;
+            send_ctl->ctl_rttvar = send_ctl->ctl_srtt / 2;
+            send_ctl->ctl_first_rtt_sample_time = 0;
+
             /* we reset BBR's cwnd here */
-            xqc_log(conn->log, XQC_LOG_DEBUG, "|OnLostDetection|%s|", "Persistent congestion occurs");
             send_ctl->ctl_cong_callback->xqc_cong_ctl_reset_cwnd(send_ctl->ctl_cong);
         }
 
@@ -1544,11 +1622,19 @@ int
 xqc_send_ctl_is_cwnd_limited(xqc_send_ctl_t *send_ctl)
 {
     if (send_ctl->ctl_cong_callback->xqc_cong_ctl_in_slow_start(send_ctl->ctl_cong)) {
-        uint32_t double_cwnd = send_ctl->ctl_max_bytes_in_flight << 1;
-        uint32_t cwnd = send_ctl->ctl_cong_callback->xqc_cong_ctl_get_cwnd(send_ctl->ctl_cong);
+        uint64_t cwnd = send_ctl->ctl_cong_callback->xqc_cong_ctl_get_cwnd(send_ctl->ctl_cong);
+#if XQC_SEND_CTL_MVFST_ENABLE_HEADROOM_CWND_LIMITED
         xqc_log(send_ctl->ctl_conn->log, XQC_LOG_DEBUG,
-                "|cwnd: %ud, 2*max_inflight: %ud|", cwnd, double_cwnd);
+                "|cwnd:%ui|inflight:%ud|cwnd_limited:%d|",
+                cwnd, send_ctl->ctl_bytes_in_flight,
+                send_ctl->ctl_is_cwnd_limited);
+        return send_ctl->ctl_is_cwnd_limited;
+#else
+        uint64_t double_cwnd = ((uint64_t)send_ctl->ctl_max_bytes_in_flight) << 1;
+        xqc_log(send_ctl->ctl_conn->log, XQC_LOG_DEBUG,
+                "|cwnd:%ui|2*max_inflight:%ui|", cwnd, double_cwnd);
         return cwnd < double_cwnd;
+#endif
     }
     return (send_ctl->ctl_is_cwnd_limited);
 }
